@@ -138,7 +138,13 @@ Reports carry a wall-clock `last`/`time` column, so a row can be lined up
 against something else that happened rather than only read as "N minutes ago".
 Rows from a previous day show the date instead of the time.
 
-`lanlog resolve [domain]` answers "where does this actually point". It reads a
+`lanlog domains` shows up to three resolved addresses per domain, with a
+`(+N more)` count when there are more (a CDN name resolves to a dozen). `lanlog
+resolve [domain]` lists them all. `lanlog backfill` populates the address table
+from the Pi-hole logs and rotations that already exist, so the column is useful
+immediately rather than only after a fresh start.
+
+The address data comes from a separate `answers` table
 separate `answers` table, built from the log's `reply`/`cached`/`cached-stale`
 lines — the only place a resolved address appears. Those lines carry no client,
 so the table is keyed on the name and *aggregated* (first seen, last seen, hit

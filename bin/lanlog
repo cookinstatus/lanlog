@@ -8,6 +8,7 @@
   lanlog client IP    what one device looked up
   lanlog shared       domains hit by more than one device
   lanlog resolve [d]  what a name resolved to (the IPs behind it)
+  lanlog backfill     read existing Pi-hole logs for resolved addresses
   lanlog third-party  cross-device trackers
   lanlog reset        wipe the database
 
@@ -817,6 +818,39 @@ def cmd_mac(args):
         print("  online    (offline -- add --online to query macvendors.com)")
 
 
+def cmd_backfill(args):
+    """Build the answers table from the logs that already exist.
+
+    The live tail only records from the moment it starts, so a fresh install (or
+    a fresh `answers` table) knows nothing about addresses resolved before then.
+    Pi-hole keeps several days of rotations, and those hold it. This is
+    idempotent: repeat answers aggregate rather than duplicate.
+    """
+    from lanlog import db as _db, ingest
+
+    conn = _db.connect()
+    before = conn.execute("SELECT COUNT(*) FROM answers").fetchone()[0]
+    print("reading Pi-hole's logs and rotations (this can take a few seconds)")
+
+    n = 0
+    names = set()
+    for line in ingest.stream_history():
+        rec = ingest.classify_answer(line)
+        if rec is None:
+            continue
+        _db.record_answer(conn, *rec)
+        names.add(rec[1])
+        n += 1
+        if args.verbose and n % 5000 == 0:
+            print(f"  {n} answer lines ...", flush=True)
+
+    after = conn.execute("SELECT COUNT(*) FROM answers").fetchone()[0]
+    distinct = conn.execute(
+        "SELECT COUNT(DISTINCT qname) FROM answers").fetchone()[0]
+    print(f"read {n} answer line(s) covering {len(names)} name(s)")
+    print(f"answers rows: {before} -> {after}   ({distinct} distinct name(s))")
+
+
 def purge_reverse(conn):
     """Delete reverse-lookup rows recorded before this filtering existed."""
     cur = conn.execute(
@@ -832,7 +866,10 @@ def main():
     sub = ap.add_subparsers(dest="cmd")
 
     d = sub.add_parser("devices"); d.add_argument("--hours", type=float)
-    sub.add_parser("domains").add_argument("--limit", type=int, default=25)
+    dsub = sub.add_parser("domains")
+    dsub.add_argument("--limit", type=int, default=25)
+    dsub.add_argument("--no-ips", action="store_true",
+                      help="omit the resolved address column")
     b = sub.add_parser("blocked",
                        help="only the domains Pi-hole blocked")
     b.add_argument("--limit", type=int, default=25)
@@ -846,6 +883,9 @@ def main():
     c = sub.add_parser("client"); c.add_argument("ip"); c.add_argument("--limit", type=int, default=40)
     sub.add_parser("reset")
     sub.add_parser("purge-reverse", help="delete stored PTR/reverse-lookup rows")
+    bf = sub.add_parser("backfill",
+                        help="read existing Pi-hole logs for resolved addresses")
+    bf.add_argument("-v", "--verbose", action="store_true")
 
     s = sub.add_parser("setup", help="detect this network and write the config")
     s.add_argument("--write", action="store_true",
@@ -889,6 +929,8 @@ def main():
         cmd_record(args)
     elif cmd == "reset":
         cmd_reset(args)
+    elif cmd == "backfill":
+        cmd_backfill(args)
     elif cmd == "purge-reverse":
         n = purge_reverse(db.connect())
         print(f"removed {n} reverse-lookup rows")
@@ -915,7 +957,8 @@ def main():
         if cmd == "devices":
             report.show_devices(conn, window)
         elif cmd == "domains":
-            report.show_top_domains(conn, args.limit, window)
+            report.show_top_domains(conn, args.limit, window,
+                                    show_ips=not args.no_ips)
         elif cmd == "blocked":
             report.show_blocked_domains(conn, args.limit, window)
         elif cmd == "client":

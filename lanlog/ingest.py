@@ -151,6 +151,31 @@ def stream(container="pihole", log="/var/log/pihole/pihole.log"):
         proc.terminate()
 
 
+def stream_history(container="pihole", pattern="/var/log/pihole/pihole.log*"):
+    """Yield lines from the existing log AND its rotations, oldest file first.
+
+    The live tail only sees what happens from the moment it starts, so every
+    address a name resolved to before that is missing. The rotations hold it:
+    pihole.log.1 is yesterday, .2.gz the day before, and so on.
+
+    `zcat -f` reads plain and gzipped files alike, so one command covers both,
+    and `ls -1tr` orders by mtime so the oldest file is read first.
+    """
+    inner = (f"ls -1tr {pattern} 2>/dev/null | xargs -r zcat -f 2>/dev/null")
+    proc = subprocess.Popen(
+        ["podman", "exec", container, "sh", "-c", inner],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        for line in proc.stdout:
+            yield line.rstrip("\n")
+    finally:
+        proc.terminate()
+
+
 def is_address(text):
     """True if `text` is a literal IPv4/IPv6 address.
 

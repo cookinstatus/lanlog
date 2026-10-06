@@ -133,16 +133,21 @@ def record_answer(conn, ts, qname, ip, qtype=None, kind=None, source="pihole"):
     One row per (qname, ip): the first time it was seen, the last, and a hit
     count. Storing each reply line instead would be one row per cached answer
     per second, which is the same information at a thousand times the size.
+
+    first_seen/last_seen use MIN/MAX rather than assignment so backfilling from
+    older logs does not matter which order the lines arrive in -- a rotation
+    read newest-first would otherwise set first_seen to the newest sighting.
     """
     conn.execute(
         """
         INSERT INTO answers (qname, ip, qtype, kind, first_seen, last_seen, hits)
         VALUES (?, ?, ?, ?, ?, ?, 1)
         ON CONFLICT(qname, ip) DO UPDATE SET
-            last_seen = excluded.last_seen,
-            kind      = COALESCE(excluded.kind, answers.kind),
-            qtype     = COALESCE(excluded.qtype, answers.qtype),
-            hits      = answers.hits + 1
+            first_seen = MIN(answers.first_seen, excluded.first_seen),
+            last_seen  = MAX(answers.last_seen, excluded.last_seen),
+            kind       = COALESCE(excluded.kind, answers.kind),
+            qtype      = COALESCE(excluded.qtype, answers.qtype),
+            hits       = answers.hits + 1
         """,
         (qname, ip, qtype, kind, ts, ts),
     )

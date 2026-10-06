@@ -201,7 +201,7 @@ def _block_table():
     return blocking.domains()
 
 
-def _verdict_header():
+def _verdict_header(with_ips=False):
     """Column header and separator for a report that shows blocking.
 
     The "blocked by" column is only printed when gravity is actually readable.
@@ -210,15 +210,54 @@ def _verdict_header():
     """
     from lanlog import blocking
 
+    ips_head = f" {'address':<44}" if with_ips else ""
+    ips_sep = 46 if with_ips else 0
     if not _block_table():
-        return (f"{'domain':<50} {'queries':>8} {'devices':>8}", "-" * 70,
-                False)
-    return (f"{'domain':<50} {'queries':>8} {'devices':>8}  blocked by",
-            "-" * 80, True)
+        return (f"{'domain':<50} {'queries':>8} {'devices':>8}{ips_head}",
+                "-" * (70 + ips_sep), False)
+    return (f"{'domain':<50} {'queries':>8} {'devices':>8}{ips_head}  blocked by",
+            "-" * (80 + ips_sep), True)
 
 
-def show_top_domains(conn, limit=25, window=None):
-    """Busiest domains overall, flagged with what blocked them if anything did."""
+def _answers_for(conn, qnames, max_shown=3):
+    """{qname: "ip1, ip2, ip3 (+13 more)"} for the names given, best-effort.
+
+    Addresses come from the `answers` table (the log's reply/cached lines). A
+    name with no recorded answer is simply absent from the result -- showing
+    nothing is honest, and the alternative (guessing, or leaving a stale address
+    in place) is not.
+
+    Capped, because a CDN name resolves to a dozen addresses and an uncapped
+    column turns one row into a wall of text that pushes every other row off the
+    screen. The count of what was omitted is kept so the truncation is visible
+    rather than silently pretending there were only three.
+    """
+    if not qnames:
+        return {}
+    out = {}
+    # Chunked so a long list cannot exceed SQLite's bound-variable limit.
+    names = list(qnames)
+    for i in range(0, len(names), 400):
+        chunk = names[i:i + 400]
+        marks = ",".join("?" * len(chunk))
+        for qname, ip in conn.execute(
+            f"SELECT qname, ip FROM answers WHERE qname IN ({marks}) "
+            f"ORDER BY qname, last_seen DESC", chunk
+        ):
+            out.setdefault(qname, []).append(ip)
+    shaped = {}
+    for qname, ips in out.items():
+        if len(ips) > max_shown:
+            extra = len(ips) - max_shown
+            shaped[qname] = f"{', '.join(ips[:max_shown])} (+{extra} more)"
+        else:
+            shaped[qname] = ", ".join(ips)
+    return shaped
+
+
+def show_top_domains(conn, limit=25, window=None, show_ips=True):
+    """Busiest domains overall, with the addresses they resolved to and whether
+    Pi-hole blocked them."""
     from lanlog import blocking
 
     sql = "SELECT qname, COUNT(*) c, COUNT(DISTINCT client) n FROM queries"
@@ -231,12 +270,17 @@ def show_top_domains(conn, limit=25, window=None):
     if not rows:
         print("no queries recorded yet")
         return
-    head, sep, show_block = _verdict_header()
+    head, sep, show_block = _verdict_header(show_ips)
     print(head)
     print(sep)
     table = _block_table() if show_block else None
+    ips = _answers_for(conn, [r[0] for r in rows]) if show_ips else {}
     for qname, c, n in rows:
+        # The address column is appended LAST and never truncated: the domain is
+        # already clipped at 50, and a half-shown address is worse than none.
         line = f"{qname[:50]:<50} {c:>8} {n:>8}"
+        if show_ips:
+            line += f"  {ips.get(qname, '-')}"
         if show_block:
             match = blocking.blocked_by(qname, table)
             # A colour alone is unreadable to anyone whose terminal does not
