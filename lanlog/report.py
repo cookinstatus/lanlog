@@ -440,28 +440,64 @@ def show_latest(conn, limit=8, window=None):
     names = identify.describe_all(conn)
     mode = _label_mode()
     show_block = bool(_block_table())
-    # The device column is sized to the mode rather than fixed. "both" mode
-    # produces "name (192.168.1.163)", which is 26 characters at the very
-    # least, so the old hardcoded 24 truncated the address off the end of every
-    # row -- which defeats the point of a mode whose job is to show you both.
-    # Width is computed from the rows actually on screen so nothing is cut.
-    dev_w = max([24] + [len(_label({"ip": r["client"]}, names, mode))
-                        for r in rows])
-    dev_w = min(dev_w, 44)
+    # Sized to the terminal. This is the tray popup's default view and its
+    # window is only ~608px wide (~76 columns), so a 134-character row was cut
+    # off at the right edge -- which is what made the address look like it was
+    # floating loose. The address is the thing being asked for, so the other
+    # columns yield to it rather than the other way round.
+    width = _term_width()
+    mark_w = 8 if show_block else 0
+    if width >= 108:
+        tcol, tfmt, show_type = 9, "%H:%M:%S", True
+    elif width >= 96:
+        tcol, tfmt, show_type = 9, "%H:%M:%S", True
+    else:
+        # Compact: HH:MM only and no query type, which is what buys the room for
+        # an address in a narrow popup.
+        tcol, tfmt, show_type = 5, "%H:%M", False
+    type_w = 6 if show_type else 0
+    # Device column from the rows on screen, floored so the address still fits.
+    want_dev = max([14] + [len(_label({"ip": r["client"]}, names, mode))
+                           for r in rows])
+    dev_w = min(want_dev, 40, max(10, width // 5))
+    dom_w = 30 if width >= 96 else 24
+    overhead = (1 + tcol + 1 + dev_w + (1 + type_w if show_type else 0)
+                + (1 + mark_w if show_block else 0) + 1 + dom_w + 1)
+    addr_w = width - overhead
+    if addr_w < 14:
+        # Shrink the device column before giving up on the address.
+        dev_w = max(10, dev_w - (14 - addr_w))
+        overhead = (1 + tcol + 1 + dev_w + (1 + type_w if show_type else 0)
+                    + (1 + mark_w if show_block else 0) + 1 + dom_w + 1)
+        addr_w = width - overhead
+    show_addr = addr_w >= 14
+    if not show_addr:
+        addr_w = 0
+        dom_w = max(16, width - (1 + tcol + 1 + dev_w
+                                 + (1 + type_w if show_type else 0)
+                                 + (1 + mark_w if show_block else 0) + 1))
+
+    def _t(ts):
+        return time.strftime(tfmt, time.localtime(ts))
+
     # The mark column is only printed when the blocklist is readable. A column
     # of blanks would read as "nothing was blocked", which is the one claim this
     # must never make on no evidence.
+    head = f"{'time':<{tcol}} {'device':<{dev_w}}"
+    if show_type:
+        head += f" {'type':<6}"
     if show_block:
-        print(f"{'time':<9} {'device':<{dev_w}} {'type':<6} {'':<8} domain")
-        print("-" * (9 + dev_w + 6 + 8 + 6 + 44))
-    else:
-        print(f"{'time':<9} {'device':<{dev_w}} {'type':<6} domain")
-        print("-" * (9 + dev_w + 6 + 6 + 44))
+        head += f" {'':<8}"
+    head += f" {'domain':<{dom_w}} address" if show_addr else " domain"
+    print(head)
+    print("-" * min(width, len(head)))
 
     n_blocked = 0
     for r in rows:
         label = _label({"ip": r["client"]}, names, mode)
-        line = f"{_fmt_clock(r['ts']):<9} {_fit(label, dev_w):<{dev_w}} {r['qtype']:<6}"
+        line = f"{_t(r['ts']):<{tcol}} {_fit(label, dev_w):<{dev_w}}"
+        if show_type:
+            line += f" {r['qtype']:<6}"
         if show_block:
             # Pad the PLAIN text to the column width and colour it afterwards.
             # Padding the wrapped string instead counts the escape bytes as
@@ -472,9 +508,12 @@ def show_latest(conn, limit=8, window=None):
             mark = _c(plain, "1;31" if r["blocked"] else "32")
             line += f" {mark:<8}{' ' * (8 - len(plain))}"
             n_blocked += 1 if r["blocked"] else 0
-        line += f" {r['qname'][:44]}"
-        if r.get("address"):
-            line += f"  {_c(r['address'], '2')}"
+        if show_addr:
+            line += f" {r['qname'][:dom_w]:<{dom_w}}"
+            if r.get("address"):
+                line += f" {r['address'][:addr_w]}"
+        else:
+            line += f" {r['qname'][:dom_w]}"
         print(line)
 
     if show_block:
