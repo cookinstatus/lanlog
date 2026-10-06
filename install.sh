@@ -103,17 +103,18 @@ fi
 # ---------------------------------------------------------------- icon
 say "Installing the icon"
 mkdir -p "${ICONS}"
-cat > "${ICONS}/lanlog-tray.svg" <<'SVG'
-<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-  <g fill="none" stroke="#2e3436" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round">
-    <rect x="1.5" y="3" width="13" height="8" rx="1"/>
-    <path d="M5 13.5h6M8 11v2.5"/>
-  </g>
-  <circle cx="8" cy="7" r="1.6" fill="#3584e4"/>
-</svg>
-SVG
-ok "icon -> ${ICONS}/lanlog-tray.svg"
+# Copied from the project, never generated here. An earlier version of this
+# script wrote its own generic monitor glyph, which silently replaced the real
+# pixel-art "LL" logo on any machine that ran the installer -- the icon looked
+# like it had simply vanished.
+SRC_ICON="${HERE}/icons/hicolor/scalable/apps/lanlog-tray.svg"
+if [ -f "${SRC_ICON}" ]; then
+    install -m644 "${SRC_ICON}" "${ICONS}/lanlog-tray.svg"
+    ok "icon -> ${ICONS}/lanlog-tray.svg"
+else
+    warn "icon missing from the project: ${SRC_ICON}"
+    warn "the tray will fall back to a stock network icon."
+fi
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache -f -t "$(dirname "$(dirname "$(dirname "${ICONS}")")")" >/dev/null 2>&1 || true
 fi

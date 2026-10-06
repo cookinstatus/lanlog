@@ -75,6 +75,7 @@ starts at login from `~/.config/autostart/lanlog-tray.desktop`.
       report.py           the reports, shared by CLI, dashboard and tray
       keys.py, banner.py  dashboard input and logo
       config.py           network auto-detection (`lanlog setup`)
+    icons/hicolor/        the tray's pixel-art "LL" icon
     tests/                regression tests (run: python3 tests/test_*.py)
     install.sh
 
