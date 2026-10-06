@@ -31,6 +31,12 @@ def _label(row, names=None, mode="names"):
     if mode == "ip":
         return ip
     if mode == "both":
+        # "localhost" is not an address anyone needs to read back, and pairing
+        # it with the name produced "this machine (localhost)" -- 24 characters
+        # that truncate to "this mac (l" in a narrow popup. The name alone says
+        # everything the pair did.
+        if ip == "localhost":
+            return name
         if name == ip or name.startswith(f"{ip} "):
             return name
         return f"{name} ({ip})"
