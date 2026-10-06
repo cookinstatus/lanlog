@@ -45,6 +45,7 @@ setting in `~/.config/lanlog/config`.
     lanlog blocked              only what Pi-hole blocked
     lanlog client 192.168.1.74  what one device looked up
     lanlog shared               domains hit by more than one device
+    lanlog resolve [domain]     what a name resolved to (the IPs behind it)
     lanlog third-party          cross-device trackers
     lanlog reset                wipe the database
     lanlog purge-reverse        delete stored PTR/reverse-lookup rows
@@ -130,6 +131,24 @@ is not reachable that way.
 A domain counts as blocked if it, or any parent of it, is listed — matching how
 dnsmasq evaluates the lists — and the report names the listed domain that caught
 it, which is the actionable half of the answer.
+
+## Timestamps and resolved addresses
+
+Reports carry a wall-clock `last`/`time` column, so a row can be lined up
+against something else that happened rather than only read as "N minutes ago".
+Rows from a previous day show the date instead of the time.
+
+`lanlog resolve [domain]` answers "where does this actually point". It reads a
+separate `answers` table, built from the log's `reply`/`cached`/`cached-stale`
+lines — the only place a resolved address appears. Those lines carry no client,
+so the table is keyed on the name and *aggregated* (first seen, last seen, hit
+count) rather than stored one row per reply; a cached name is answered dozens of
+times a minute and an event log of that would grow without bound. Non-address
+answers (`<CNAME>`, `NODATA`, `NXDOMAIN`) are skipped, so a lookup never returns
+something that is not an address.
+
+The query rows and the answer rows are deliberately not joined: only the query
+rows carry a client, so attributing an answer to a device would mean guessing.
 
 ## Notes on this setup
 

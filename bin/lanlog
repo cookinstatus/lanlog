@@ -7,6 +7,7 @@
   lanlog domains      most-queried domains
   lanlog client IP    what one device looked up
   lanlog shared       domains hit by more than one device
+  lanlog resolve [d]  what a name resolved to (the IPs behind it)
   lanlog third-party  cross-device trackers
   lanlog reset        wipe the database
 
@@ -218,7 +219,7 @@ def dashboard(conn, window=900):
                 resolver.get(ip)
 
             fresh = list(conn.execute(
-                "SELECT client, qtype, qname FROM queries ORDER BY ts DESC LIMIT ?",
+                "SELECT ts, client, qtype, qname FROM queries ORDER BY ts DESC LIMIT ?",
                 (query_lines,),
             ))
             # Blocking verdict per visible query, computed once per frame and
@@ -354,9 +355,10 @@ def dashboard(conn, window=900):
 
             if fresh:
                 out.append(_c(" LATEST QUERIES", BOLD))
-                for client, qtype, qname in fresh:
+                for ts, client, qtype, qname in fresh:
                     dw = 24 if labels == "names" else 38
-                    out.append(f" {_dev(client, dw):<{dw}} {qtype:<6} "
+                    out.append(f" {report._fmt_clock(ts):<9} "
+                               f"{_dev(client, dw):<{dw}} {qtype:<6} "
                                f"{_block_mark(verdicts.get(qname))}"
                                f"{qname[:40]}")
                 out.append("")
@@ -494,6 +496,8 @@ def _run_quick(conn, cmd):
                 report.show_blocked_domains(conn, 10)
             elif name == "shared":
                 report.show_shared(conn, 10)
+            elif name == "resolve":
+                report.show_resolve(conn, args[0] if args else None, 10)
             elif name == "third-party":
                 report.show_third_party(conn)
             elif name == "client" and args:
@@ -834,6 +838,10 @@ def main():
     b.add_argument("--limit", type=int, default=25)
     b.add_argument("--hours", type=float)
     sub.add_parser("shared").add_argument("--limit", type=int, default=30)
+    rv = sub.add_parser("resolve", help="what a name resolved to (addresses)")
+    rv.add_argument("name", nargs="?", help="domain, or omit for most recent")
+    rv.add_argument("--limit", type=int, default=25)
+    rv.add_argument("--hours", type=float)
     sub.add_parser("third-party").add_argument("--hours", type=float, default=24.0)
     c = sub.add_parser("client"); c.add_argument("ip"); c.add_argument("--limit", type=int, default=40)
     sub.add_parser("reset")
@@ -914,6 +922,8 @@ def main():
             report.show_client(conn, args.ip, args.limit)
         elif cmd == "shared":
             report.show_shared(conn, args.limit)
+        elif cmd == "resolve":
+            report.show_resolve(conn, args.name, args.limit, window)
         elif cmd == "third-party":
             report.show_third_party(conn, args.hours * 3600)
 

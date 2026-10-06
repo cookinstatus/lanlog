@@ -32,6 +32,26 @@ CREATE TABLE IF NOT EXISTS queries (
 CREATE INDEX IF NOT EXISTS idx_queries_ts     ON queries(ts);
 CREATE INDEX IF NOT EXISTS idx_queries_client ON queries(client);
 CREATE INDEX IF NOT EXISTS idx_queries_name   ON queries(qname);
+
+-- Which addresses a name resolved to. The query log's reply/cached lines carry
+-- the answer but NOT the client that asked, so this is keyed on the name alone
+-- and aggregated rather than stored as one row per reply: a cached name is
+-- answered dozens of times a minute, and an event log of that would grow
+-- without bound for no extra information. hits/last_seen carry the "how often,
+-- how recently" that the raw lines would have.
+CREATE TABLE IF NOT EXISTS answers (
+    qname      TEXT NOT NULL,
+    ip         TEXT NOT NULL,
+    qtype      TEXT,             -- A / AAAA, inferred from the address family
+    kind       TEXT,             -- reply | cached | cached-stale
+    first_seen REAL NOT NULL,
+    last_seen  REAL NOT NULL,
+    hits       INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (qname, ip)
+);
+
+CREATE INDEX IF NOT EXISTS idx_answers_name ON answers(qname);
+CREATE INDEX IF NOT EXISTS idx_answers_seen ON answers(last_seen);
 """
 
 
@@ -105,3 +125,24 @@ def record_query(conn, ts, client, qname, qtype, outcome, detail=None,
         (ts, client, qname, qtype, outcome, detail, source),
     )
     touch_device(conn, client, when=ts)
+
+
+def record_answer(conn, ts, qname, ip, qtype=None, kind=None, source="pihole"):
+    """Record that `qname` resolved to `ip`, aggregating repeat answers.
+
+    One row per (qname, ip): the first time it was seen, the last, and a hit
+    count. Storing each reply line instead would be one row per cached answer
+    per second, which is the same information at a thousand times the size.
+    """
+    conn.execute(
+        """
+        INSERT INTO answers (qname, ip, qtype, kind, first_seen, last_seen, hits)
+        VALUES (?, ?, ?, ?, ?, ?, 1)
+        ON CONFLICT(qname, ip) DO UPDATE SET
+            last_seen = excluded.last_seen,
+            kind      = COALESCE(excluded.kind, answers.kind),
+            qtype     = COALESCE(excluded.qtype, answers.qtype),
+            hits      = answers.hits + 1
+        """,
+        (qname, ip, qtype, kind, ts, ts),
+    )

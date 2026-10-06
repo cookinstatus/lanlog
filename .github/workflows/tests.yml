@@ -18,7 +18,7 @@ jobs:
       - name: Run the test suite
         run: |
           set -e
-          for t in tests/test_blocking.py tests/test_keys.py tests/test_labels.py tests/test_layout.py; do
+          for t in tests/test_blocking.py tests/test_ingest.py tests/test_keys.py tests/test_labels.py tests/test_layout.py; do
             echo "=== $t"
             python3 "$t"
           done

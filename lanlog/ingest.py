@@ -17,6 +17,20 @@ QUERY_RE = re.compile(
     r"^(?P<ts>\w{3}\s+\d+\s+\d+:\d+:\d+)\s+dnsmasq\[\d+\]:\s+"
     r"query\[(?P<qtype>\w+)\]\s+(?P<qname>\S+)\s+from\s+(?P<client>\S+)"
 )
+
+# "Oct  6 00:53:29 dnsmasq[48]: reply www.youtube.com is 142.251.157.4"
+# "Oct  6 00:53:29 dnsmasq[48]: cached www.youtube.com is 142.251.157.4"
+# "Oct  6 00:53:29 dnsmasq[48]: cached-stale www.youtube.com is <CNAME>"
+#
+# These carry the resolved address but NOT the client that asked, so they cannot
+# be attributed to a device. They are still worth keeping: "what does this name
+# actually resolve to" is the question the query rows cannot answer, and these
+# lines are the only place the address appears. Non-address answers (<CNAME>,
+# NODATA, NXDOMAIN, NODATA-IPv6) are skipped by is_address().
+ANSWER_RE = re.compile(
+    r"^(?P<ts>\w{3}\s+\d+\s+\d+:\d+:\d+)\s+dnsmasq\[\d+\]:\s+"
+    r"(?P<kind>reply|cached|cached-stale)\s+(?P<qname>\S+)\s+is\s+(?P<ip>\S+)"
+)
 # Domains that only ever appear in reverse lookups.
 REVERSE_SUFFIXES = ("in-addr.arpa", "ip6.arpa")
 
@@ -137,6 +151,22 @@ def stream(container="pihole", log="/var/log/pihole/pihole.log"):
         proc.terminate()
 
 
+def is_address(text):
+    """True if `text` is a literal IPv4/IPv6 address.
+
+    Reply lines also carry `<CNAME>`, `NODATA`, `NODATA-IPv6` and `NXDOMAIN`.
+    Only real addresses belong in the answers table; storing the sentinels would
+    make "what does this resolve to" return a value that is not an address.
+    """
+    if not text or not text[0].isdigit() and ":" not in text:
+        return False
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+
+
 def classify(line):
     """Return (ts, client, qname, qtype, outcome, detail) or None."""
     m = QUERY_RE.match(line)
@@ -161,3 +191,25 @@ def classify(line):
     if ts is None:
         return None
     return (ts, client, qname, qtype, "query", None)
+
+
+def classify_answer(line):
+    """Return (ts, qname, ip, qtype, kind) for a reply line, or None.
+
+    qtype is inferred from the address family: the reply line does not say
+    whether the original query was A or AAAA, but the answer's own shape does.
+    """
+    m = ANSWER_RE.match(line)
+    if not m:
+        return None
+    ip = m.group("ip").rstrip(".")
+    if not is_address(ip):
+        return None
+    qname = m.group("qname").lower().rstrip(".")
+    if not qname or qname.endswith(REVERSE_SUFFIXES):
+        return None
+    qtype = "AAAA" if ":" in ip else "A"
+    ts = parse_ts(m.group("ts"))
+    if ts is None:
+        return None
+    return (ts, qname, ip, qtype, m.group("kind"))

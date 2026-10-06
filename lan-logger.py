@@ -49,20 +49,34 @@ def _stop(*_):
 
 
 def query_loop(conn, verbose):
-    """Stream Pi-hole query lines into the DB. Exits if the stream dies."""
+    """Stream Pi-hole log lines into the DB. Exits if the stream dies.
+
+    Both the query lines and the reply/cached lines are read from the same
+    stream: a query line becomes a row in `queries` (which device asked for
+    what), a reply line becomes an aggregated row in `answers` (what the name
+    resolved to). The two are separate tables because only the first carries a
+    client -- joining them back together would mean guessing which device a
+    reply belonged to.
+    """
     seen = 0
+    answers = 0
     for line in ingest.stream():
         if not _running:
             break
         rec = ingest.classify(line)
-        if rec is None:
+        if rec is not None:
+            db.record_query(conn, *rec)
+            seen += 1
+            # No commit needed: autocommit mode (see db.connect).
+            if verbose:
+                print(f"{rec[1]:>15}  {rec[3]:<6} {rec[2]}", flush=True)
             continue
-        db.record_query(conn, *rec)
-        seen += 1
-        # No commit needed: the connection is in autocommit mode (see db.connect).
-        if verbose:
-            print(f"{rec[1]:>15}  {rec[3]:<6} {rec[2]}", flush=True)
-    print(f"ingest stream ended after {seen} queries", file=sys.stderr)
+        ans = ingest.classify_answer(line)
+        if ans is not None:
+            db.record_answer(conn, *ans)
+            answers += 1
+    print(f"ingest stream ended after {seen} queries, {answers} answers",
+          file=sys.stderr)
     return seen
 
 

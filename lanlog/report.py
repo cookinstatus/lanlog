@@ -84,6 +84,21 @@ def _fmt_age(ts):
     return f"{delta // 86400}d ago"
 
 
+def _fmt_clock(ts):
+    """Wall-clock time for a row, e.g. '22:39:12'.
+
+    Rows used to carry only a relative age, which answers "how long ago" but not
+    "when" -- and "when" is what you need to line a query up against something
+    else that happened. The date is added when the row is not from today, so a
+    stale database does not look like it is from this evening.
+    """
+    lt = time.localtime(ts)
+    now = time.localtime()
+    if (lt.tm_year, lt.tm_yday) == (now.tm_year, now.tm_yday):
+        return time.strftime("%H:%M:%S", lt)
+    return time.strftime("%b %d %H:%M", lt)
+
+
 def devices(conn, window=None):
     sql = "SELECT * FROM devices"
     args = ()
@@ -248,17 +263,20 @@ def latest_rows(conn, limit=8, window=None):
 
     table = _block_table()
     if window:
-        sql = ("SELECT client, qtype, qname FROM queries WHERE ts >= ? "
+        sql = ("SELECT ts, client, qtype, qname FROM queries WHERE ts >= ? "
                "ORDER BY ts DESC LIMIT ?")
         args = (time.time() - window, limit)
     else:
-        sql = "SELECT client, qtype, qname FROM queries ORDER BY ts DESC LIMIT ?"
+        sql = ("SELECT ts, client, qtype, qname FROM queries "
+               "ORDER BY ts DESC LIMIT ?")
         args = (limit,)
 
     out = []
-    for client, qtype, qname in conn.execute(sql, args):
+    for ts, client, qtype, qname in conn.execute(sql, args):
         match = blocking.blocked_by(qname, table) if table else None
         out.append({
+            "ts": ts,
+            "clock": _fmt_clock(ts),
             "client": client,
             "qtype": qtype,
             "qname": qname,
@@ -298,16 +316,16 @@ def show_latest(conn, limit=8, window=None):
     # of blanks would read as "nothing was blocked", which is the one claim this
     # must never make on no evidence.
     if show_block:
-        print(f"{'device':<{dev_w}} {'type':<6} {'':<8} domain")
-        print("-" * (dev_w + 6 + 8 + 6 + 44))
+        print(f"{'time':<9} {'device':<{dev_w}} {'type':<6} {'':<8} domain")
+        print("-" * (9 + dev_w + 6 + 8 + 6 + 44))
     else:
-        print(f"{'device':<{dev_w}} {'type':<6} domain")
-        print("-" * (dev_w + 6 + 6 + 44))
+        print(f"{'time':<9} {'device':<{dev_w}} {'type':<6} domain")
+        print("-" * (9 + dev_w + 6 + 6 + 44))
 
     n_blocked = 0
     for r in rows:
         label = _label({"ip": r["client"]}, names, mode)
-        line = f"{_fit(label, dev_w):<{dev_w}} {r['qtype']:<6}"
+        line = f"{_fmt_clock(r['ts']):<9} {_fit(label, dev_w):<{dev_w}} {r['qtype']:<6}"
         if show_block:
             # Pad the PLAIN text to the column width and colour it afterwards.
             # Padding the wrapped string instead counts the escape bytes as
@@ -383,9 +401,52 @@ def _c(text, code):
     return f"\033[{code}m{text}\033[0m"
 
 
+def show_resolve(conn, name=None, limit=25, window=None):
+    """What a name resolved to, or the most recently resolved names.
+
+    Reads the `answers` table, which is built from the log's reply/cached lines.
+    Those lines carry no client, so this report is deliberately name-keyed: it
+    answers "where does this actually point", not "who looked it up" (that is
+    `lanlog client`, off the query rows).
+    """
+    if name:
+        like = name.strip().lower().rstrip(".")
+        rows = list(conn.execute(
+            "SELECT qname, ip, qtype, kind, first_seen, last_seen, hits "
+            "FROM answers WHERE qname = ? OR qname LIKE ? "
+            "ORDER BY last_seen DESC LIMIT ?",
+            (like, f"%.{like}", limit),
+        ))
+    else:
+        sql = ("SELECT qname, ip, qtype, kind, first_seen, last_seen, hits "
+               "FROM answers")
+        args = ()
+        if window:
+            sql += " WHERE last_seen >= ?"
+            args = (time.time() - window,)
+        sql += " ORDER BY last_seen DESC LIMIT ?"
+        rows = list(conn.execute(sql, args + (limit,)))
+
+    if not rows:
+        print(f"no resolved addresses recorded for {name!r}" if name
+              else "no resolved addresses recorded yet")
+        print("(answers come from the log's reply/cached lines; if this is "
+              "empty,")
+        print(" the logger may have been started before this feature existed)")
+        return
+
+    print(f"{'domain':<46} {'address':<40} {'type':<5} {'last':<9} hits")
+    print("-" * 110)
+    for qname, ip, qtype, kind, _first, last, hits in rows:
+        print(f"{qname[:46]:<46} {ip[:40]:<40} {str(qtype or ''):<5} "
+              f"{_fmt_clock(last):<9} {hits}")
+    n_names = len({r[0] for r in rows})
+    print(f"\n{len(rows)} address(es) across {n_names} name(s)")
+
+
 def show_client(conn, ip, limit=40):
     rows = list(conn.execute(
-        "SELECT qname, qtype, COUNT(*) c FROM queries WHERE client=? "
+        "SELECT qname, qtype, COUNT(*) c, MAX(ts) last FROM queries WHERE client=? "
         "GROUP BY qname, qtype ORDER BY c DESC LIMIT ?",
         (ip, limit),
     ))
@@ -397,27 +458,27 @@ def show_client(conn, ip, limit=40):
     name = _label({"ip": ip}, names, mode)
     total = sum(r[2] for r in rows)
     print(f"{name}  ({ip}): {total} queries, top {len(rows)}")
-    print(f"{'domain':<50} {'type':<6} {'queries':>8}")
-    print("-" * 68)
-    for qname, qtype, c in rows:
-        print(f"{qname[:50]:<50} {qtype:<6} {c:>8}")
+    print(f"{'domain':<50} {'type':<6} {'queries':>8}  last")
+    print("-" * 80)
+    for qname, qtype, c, last in rows:
+        print(f"{qname[:50]:<50} {qtype:<6} {c:>8}  {_fmt_clock(last)}")
 
 
 def show_shared(conn, limit=30):
     """Domains requested by more than one device -- shared infrastructure,
     or a tracker fanning out across devices."""
     rows = list(conn.execute(
-        "SELECT qname, COUNT(DISTINCT client) n, COUNT(*) c FROM queries "
-        "GROUP BY qname HAVING n > 1 ORDER BY n DESC, c DESC LIMIT ?",
+        "SELECT qname, COUNT(DISTINCT client) n, COUNT(*) c, MAX(ts) last "
+        "FROM queries GROUP BY qname HAVING n > 1 ORDER BY n DESC, c DESC LIMIT ?",
         (limit,),
     ))
     if not rows:
         print("no multi-device domains yet")
         return
-    print(f"{'domain':<50} {'devices':>8} {'queries':>8}")
-    print("-" * 70)
-    for qname, n, c in rows:
-        print(f"{qname[:50]:<50} {n:>8} {c:>8}")
+    print(f"{'domain':<46} {'devices':>7} {'queries':>7}  last")
+    print("-" * 78)
+    for qname, n, c, last in rows:
+        print(f"{qname[:46]:<46} {n:>7} {c:>7}  {_fmt_clock(last)}")
 
 
 def show_third_party(conn, window=86400):
@@ -431,8 +492,10 @@ def show_third_party(conn, window=86400):
     # grouping on them produced in-addr.arpa as a "shared third-party domain".
     skip_suffixes = ("in-addr.arpa", "ip6.arpa")
     buckets = defaultdict(set)
-    for qname, client in conn.execute(
-        "SELECT qname, client FROM queries WHERE ts >= ?", (time.time() - window,)
+    last_seen = {}
+    for qname, client, ts in conn.execute(
+        "SELECT qname, client, ts FROM queries WHERE ts >= ?",
+        (time.time() - window,)
     ):
         if qname.endswith(skip_suffixes):
             continue
@@ -441,15 +504,17 @@ def show_third_party(conn, window=86400):
             cand = ".".join(labels[i:])
             if labels[i] not in noise and len(cand.split(".")) >= 2:
                 buckets[cand].add(client)
+                if ts > last_seen.get(cand, 0):
+                    last_seen[cand] = ts
     rows = [(d, len(v)) for d, v in buckets.items() if len(v) >= 2]
     rows.sort(key=lambda r: -r[1])
     if not rows:
         print("no cross-device third-party domains in the last 24h")
         return
-    print(f"{'domain':<50} {'devices':>8}")
-    print("-" * 60)
+    print(f"{'domain':<46} {'devices':>7}  last")
+    print("-" * 66)
     for d, n in rows[:40]:
-        print(f"{d[:50]:<50} {n:>8}")
+        print(f"{d[:46]:<46} {n:>7}  {_fmt_clock(last_seen.get(d, 0))}")
 
 
 def main():
