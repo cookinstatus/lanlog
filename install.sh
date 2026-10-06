@@ -110,7 +110,26 @@ mkdir -p "${ICONS}"
 SRC_ICON="${HERE}/icons/hicolor/scalable/apps/lanlog-tray.svg"
 if [ -f "${SRC_ICON}" ]; then
     install -m644 "${SRC_ICON}" "${ICONS}/lanlog-tray.svg"
-    ok "icon -> ${ICONS}/lanlog-tray.svg"
+    # Also install under a content-stamped name. GNOME's appindicator extension
+    # caches tray icons by NAME alone (its key has no mtime and no content), and
+    # it prefers IconName over IconPixmap -- so a fixed name keeps drawing the
+    # old image across restarts. A name derived from the file's digest changes
+    # when the image changes, which is the only thing that defeats that cache.
+    if command -v sha1sum >/dev/null 2>&1; then
+        STAMP="$(sha1sum "${SRC_ICON}" | cut -c1-8)"
+        install -m644 "${SRC_ICON}" "${ICONS}/lanlog-tray-${STAMP}.svg"
+        ok "icon -> ${ICONS}/lanlog-tray.svg  (stamped: lanlog-tray-${STAMP})"
+    else
+        ok "icon -> ${ICONS}/lanlog-tray.svg"
+    fi
+    # Remove stamps from previous installs so they do not accumulate.
+    for old in "${ICONS}"/lanlog-tray-*.svg; do
+        [ -e "$old" ] || continue
+        case "$old" in
+            *"lanlog-tray-${STAMP}.svg") ;;
+            *) rm -f "$old" ;;
+        esac
+    done
 else
     warn "icon missing from the project: ${SRC_ICON}"
     warn "the tray will fall back to a stock network icon."

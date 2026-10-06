@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lanlog"
-version = "1.4.5"
+version = "1.4.6"
 description = "See what devices on your LAN are talking to, right now (Pi-hole DNS logger + dashboard + tray)"
 readme = "README.md"
 requires-python = ">=3.9"

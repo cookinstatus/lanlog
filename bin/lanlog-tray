@@ -160,13 +160,48 @@ POPUP_REFRESH_MS = 3000   # label/tooltip and open-popup refresh
 # treat it as a theme root: DankMaterialShell resolves it into a literal file
 # path and tries to open ~/.local/share/icons/hicolor/lanlog-tray, which is not
 # a file (the real one is under scalable/apps/ and ends .svg).
-ICON_NAME = "lanlog-tray"
+ICON_BASE = "lanlog-tray"
+# A name that changes whenever the icon's CONTENT changes.
+#
+# The appindicator extension that draws tray icons on GNOME caches them by
+# name: its key is `${type}:${name}@${size}:${theme}`, with no mtime and no
+# content in it, and it tries IconName BEFORE IconPixmap. So a fixed name stays
+# cached across tray restarts, and replacing the file on disk -- or sending
+# pixels -- changes nothing. Verified against the extension source in
+# ~/.local/share/gnome-shell/extensions/appindicatorsupport@rgcjonas.gmail.com.
+#
+# Appending a short digest of the icon makes the name itself change when the
+# image does, which is the only thing that defeats a name-keyed cache. The
+# digest is content-derived, so an unchanged icon keeps its name and the cache
+# still works as intended.
+ICON_NAME = ICON_BASE
 ICON_FALLBACKS = (
     "network-server-symbolic",
     "network-wired-symbolic",
     "computer-symbolic",
     "preferences-system-network-symbolic",
 )
+
+
+def _icon_digest():
+    """Short hex digest of the installed icon file, or None."""
+    import hashlib
+
+    theme = Gtk.IconTheme.get_default()
+    for name in (ICON_BASE,) + ICON_FALLBACKS:
+        try:
+            info = theme.lookup_icon(name, 22, 0)
+        except Exception:
+            continue
+        path = info.get_filename() if info else None
+        if not path or name != ICON_BASE:
+            continue
+        try:
+            with open(path, "rb") as fh:
+                return hashlib.sha1(fh.read()).hexdigest()[:8], path
+        except OSError:
+            return None, path
+    return None, None
 
 
 def resolve_icon():
@@ -176,19 +211,42 @@ def resolve_icon():
     program: the item registers, reports Status=Active, and the panel shows
     nothing. So names are confirmed at startup and the failure is reported.
     """
+    global ICON_NAME
     theme = Gtk.IconTheme.get_default()
     try:
         theme.rescan_if_needed()
     except Exception:
         pass
-    for name in (ICON_NAME,) + ICON_FALLBACKS:
+
+    digest, path = _icon_digest()
+    if digest:
+        # Prefer the content-stamped name when the theme has it. It is created
+        # by install.sh alongside the plain name; if it is missing we fall back
+        # to the plain one, which at least renders.
+        stamped = f"{ICON_BASE}-{digest}"
+        try:
+            if theme.lookup_icon(stamped, 22, 0) is not None:
+                ICON_NAME = stamped
+                return stamped, None
+        except Exception:
+            pass
+        try:
+            if theme.lookup_icon(ICON_BASE, 22, 0) is not None:
+                ICON_NAME = ICON_BASE
+                return ICON_BASE, None
+        except Exception:
+            pass
+
+    for name in ICON_FALLBACKS:
         try:
             if theme.lookup_icon(name, 22, 0) is not None:
+                ICON_NAME = name
                 return name, None
         except Exception:
             continue
-    return ICON_NAME, ("none of the icons resolved (tried: "
-                       f"{', '.join((ICON_NAME,) + ICON_FALLBACKS)})")
+    ICON_NAME = ICON_BASE
+    return ICON_BASE, ("none of the icons resolved (tried: "
+                       f"{ICON_BASE}, {', '.join(ICON_FALLBACKS)})")
 
 
 def conn():
