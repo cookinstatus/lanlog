@@ -12,7 +12,7 @@ import re
 import subprocess
 import time
 
-# "Sep 28 01:25:18 dnsmasq[48]: query[A] example.com from 192.168.1.151"
+# "Sep 28 01:25:18 dnsmasq[48]: query[A] example.com from 192.168.1.50"
 QUERY_RE = re.compile(
     r"^(?P<ts>\w{3}\s+\d+\s+\d+:\d+:\d+)\s+dnsmasq\[\d+\]:\s+"
     r"query\[(?P<qtype>\w+)\]\s+(?P<qname>\S+)\s+from\s+(?P<client>\S+)"
