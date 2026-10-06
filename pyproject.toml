@@ -29,7 +29,7 @@ dependencies = []
 tray = []
 
 [project.urls]
-Homepage = "https://github.com/USERNAME/lanlog"
+Homepage = "https://github.com/cookinstatus/lanlog"
 
 [tool.setuptools]
 packages = ["lanlog"]
