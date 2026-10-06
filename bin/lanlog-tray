@@ -1,0 +1,1534 @@
+#!/usr/bin/env python3
+"""lanlog-tray: a tray icon for lanlog, with a one-click report popup.
+
+Registers a StatusNotifierItem directly over D-Bus rather than going through
+AppIndicator3 / AyatanaAppIndicator3. That is deliberate, and it is the only way
+to get a genuine one-click popup on GNOME.
+
+  The library path forces a menu. An indicator with no menu does not register
+  with the tray host at all (verified: a menu-less Ayatana indicator never
+  appears in RegisteredStatusNotifierItems), and an indicator WITH a menu has
+  its click taken over by the host, which shows the menu. Either way the program
+  never receives the click, so it cannot open a popup by itself.
+
+  Registering the item by hand allows the documented SNI combination that does
+  work: export a real com.canonical.dbusmenu AND set ItemIsMenu=false. The host
+  then routes a left-click to Activate() and keeps the menu for right-click.
+  Verified on GNOME with the appindicator extension: Activate() fires with real
+  pointer coordinates and no menu is shown.
+
+  Both halves are required, and each alone fails differently:
+      real menu, no ItemIsMenu=false -> left-click shows the menu
+      ItemIsMenu=false, no menu      -> registers, but the click does nothing
+      real menu + ItemIsMenu=false   -> left-click activates, menu on right-click
+  Only the pair gives one-click. Gtk.StatusIcon (XEmbed), the other candidate,
+  is deprecated and produced no icon at all under Wayland.
+
+Runs on the system python, not a virtualenv: PyGObject and dbus-python are
+system packages and are not importable from inside a venv.
+"""
+import os
+import sys
+
+# --------------------------------------------------------------- GTK imports
+try:
+    import gi
+    gi.require_version("Gtk", "3.0")
+    # Gdk for event types / window hints / key constants, Pango for ellipsizing.
+    from gi.repository import Gtk, GLib, Gdk, Pango
+except (ImportError, ValueError) as exc:
+    sys.exit(
+        "lanlog-tray: this needs PyGObject and GTK 3, which are system packages.\n"
+        f"  reason: {exc}\n"
+        "  Debian/Ubuntu:  sudo apt install python3-gi gir1.2-gtk-3.0\n"
+        "  Fedora/RHEL:    sudo dnf install python3-gobject gtk3\n"
+        "  Arch:           sudo pacman -S --needed python-gobject gtk3\n"
+        "  openSUSE:       sudo zypper install python3-gobject gtk3\n"
+        "  Alpine:         do not use a venv; this needs the system python\n"
+        "\n"
+        "Then run:  /usr/bin/python3 bin/lanlog-tray\n"
+    )
+
+try:
+    import dbus
+    import dbus.service
+    import dbus.mainloop.glib
+except ImportError as exc:
+    sys.exit(
+        "lanlog-tray: this needs python3-dbus, which is a system package.\n"
+        f"  reason: {exc}\n"
+        "  Debian/Ubuntu:  sudo apt install python3-dbus\n"
+        "  Fedora/RHEL:    sudo dnf install python3-dbus\n"
+        "  Arch:           sudo pacman -S --needed python-dbus\n"
+        "  openSUSE:       sudo zypper install python3-dbus\n"
+    )
+
+import base64
+import importlib
+
+# The lanlog package lives in the PROJECT ROOT, one level above bin/ -- this
+# script is in bin/. So HERE is not the right place to import from; ROOT is.
+# Two paths are added because the script may be run either as bin/lanlog-tray
+# (from the project) or through the ~/.local/bin launcher, where os.path.abspath
+# does not follow the link and would point at ~/.local/bin. realpath follows it
+# back to the real location.
+#
+# report.py is now part of the package (lanlog.report), so it no longer needs a
+# separate path entry -- that is the whole point of the merged layout.
+BIN_DIR = os.path.dirname(os.path.realpath(__file__))
+ROOT = os.path.dirname(BIN_DIR)
+for _p in (ROOT, BIN_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+
+def _load(name):
+    """Import a lanlog module, reporting a clear reason if it is missing."""
+    try:
+        return importlib.import_module(name)
+    except ImportError as exc:
+        sys.exit(f"lanlog-tray: cannot import {name}: {exc}\n"
+                 "  run this from the lanlog project directory.")
+
+
+db = _load("lanlog.db")
+from lanlog import report  # noqa: E402  (part of the package now)
+
+# ---------------------------------------------------------------------------
+# Reports
+# The popup's tabs. This is the whole popup: two pages, no more.
+#
+# The reports that used to live here (domains, blocked, shared, third-party,
+# client) moved back out to the menu and the full window, because a tab per
+# report means a popup with six tabs and 60px of chrome, which is not a glance
+# any more. Queries and devices are the two that answer "is my network
+# behaving", and both are short.
+TABS = [
+    ("latest", "Queries"),
+    ("devices", "Devices"),
+]
+
+# ---------------------------------------------------------------------------
+# (key, label). The order is the order the scroll wheel cycles through.
+VIEWS = [
+    # First because it is the default view: a single click answers "what is
+    # happening right now", which is the question a tray icon actually gets
+    # asked. The rankings are one scroll away.
+    ("latest", "Latest queries"),
+    ("devices", "Devices on the network"),
+    ("domains", "Most queried domains"),
+    # Blocked traffic is a different question from "most queried", not a
+    # filter on it: the busiest domains are allowed ones, so a blocked-only
+    # report has to be its own view to be reachable from the popup at all.
+    ("blocked", "Domains Pi-hole BLOCKED"),
+    ("client", "Traffic for one client"),
+    ("shared", "Domains shared by many devices"),
+    ("third-party", "Third-party trackers"),
+]
+
+MENU_LABELS = [
+    ("latest", "Latest queries"),
+    ("devices", "Devices"),
+    ("domains", "Domains"),
+    ("blocked", "Blocked"),
+    ("client", "One client"),
+    ("shared", "Shared"),
+    ("third-party", "Third-party"),
+]
+
+# view key -> (report.py function, extra positional args)
+REPORT_FNS = {
+    "latest": ("show_latest", ()),
+    "devices": ("show_devices", ()),
+    "domains": ("show_top_domains", ()),
+    "blocked": ("show_blocked_domains", ()),
+    "shared": ("show_shared", ()),
+    "third-party": ("show_third_party", ()),
+    # client needs an IP, supplied at call time.
+    "client": ("show_client", None),
+}
+
+POPUP_REFRESH_MS = 3000   # label/tooltip and open-popup refresh
+
+# The icon is installed by install.sh into ~/.local/share/icons/hicolor, so it
+# resolves through the ordinary theme search. Naming a stock theme icon instead
+# looks like it should work but depends on the PANEL resolving the name against
+# whatever theme it happens to be using; when that lookup fails the icon is
+# simply not drawn, with no error anywhere.
+#
+# IconThemePath is deliberately never exported. A host that honours it does not
+# treat it as a theme root: DankMaterialShell resolves it into a literal file
+# path and tries to open ~/.local/share/icons/hicolor/lanlog-tray, which is not
+# a file (the real one is under scalable/apps/ and ends .svg).
+ICON_NAME = "lanlog-tray"
+ICON_FALLBACKS = (
+    "network-server-symbolic",
+    "network-wired-symbolic",
+    "computer-symbolic",
+    "preferences-system-network-symbolic",
+)
+
+
+def resolve_icon():
+    """Pick an icon name this machine's theme actually has.
+
+    An unresolvable icon name is the quietest possible failure in the whole
+    program: the item registers, reports Status=Active, and the panel shows
+    nothing. So names are confirmed at startup and the failure is reported.
+    """
+    theme = Gtk.IconTheme.get_default()
+    try:
+        theme.rescan_if_needed()
+    except Exception:
+        pass
+    for name in (ICON_NAME,) + ICON_FALLBACKS:
+        try:
+            if theme.lookup_icon(name, 22, 0) is not None:
+                return name, None
+        except Exception:
+            continue
+    return ICON_NAME, ("none of the icons resolved (tried: "
+                       f"{', '.join((ICON_NAME,) + ICON_FALLBACKS)})")
+
+
+def conn():
+    """A read-only connection to the logger's database.
+
+    Opened via uri with mode=ro so this viewer can never take a write lock the
+    logger needs, even while queries are being recorded.
+
+    Returns None when there is no database yet, rather than raising. A viewer
+    pointed at a machine where the logger has not run is an ordinary state, not
+    a failure, and crashing there would make the tray unusable exactly when
+    someone is trying to set it up.
+    """
+    import sqlite3
+    # DB_PATH lives in lanlog.db, not lanlog.config -- db.py owns the database
+    # location. The default is baked in at import time, so a LANLOG_DB override
+    # set after import is not seen; read the env directly as a fallback so this
+    # can be pointed at a copy for testing.
+    path = os.environ.get("LANLOG_DB") or db.DB_PATH
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return None
+    # report.py builds dicts from rows, so it needs sqlite3.Row exactly as the
+    # logger's own connection sets it. Without this every report dies with
+    # "dictionary update sequence element #0 has length 9; 2 is required".
+    c.row_factory = sqlite3.Row
+    return c
+
+
+def status_line(c):
+    """One line summarising what the logger is doing right now."""
+    import time
+    if c is None:
+        return ("no database yet -- start the logger with `lanlog start`, "
+                "or set LANLOG_DB to its location")
+    now = time.time()
+    try:
+        total = c.execute("select count(*) from queries").fetchone()[0]
+        recent = c.execute("select count(*) from queries where ts>=?",
+                           (now - 900,)).fetchone()[0]
+        known = c.execute("select count(*) from devices where last_seen>=?",
+                          (now - 900,)).fetchone()[0]
+        return (f"{total:,} queries total   {recent:,} in last 15m   "
+                f"{known:,} devices present")
+    except Exception as exc:
+        return f"could not read the database: {exc}"
+
+
+NO_DB_TEXT = (
+    "No database found yet.\n\n"
+    "The tray reads whatever the lanlog logger writes, so start it:\n"
+    "    lanlog start\n\n"
+    "If the logger lives somewhere else, point at it:\n"
+    "    LANLOG_DB=/path/to/lanlog.db lanlog-tray")
+
+
+def render(c, view, client_ip=""):
+    """Render one report by calling report.py's function for it.
+
+    Every report already exists in report.py, which is also what the terminal
+    dashboard uses. Reimplementing them here would guarantee the two could
+    disagree about what "domains" means, so stdout is captured instead.
+    """
+    if c is None:
+        return NO_DB_TEXT
+    entry = REPORT_FNS.get(view)
+    if entry is None:
+        return f"No report named {view!r}."
+    fn_name, extra = entry
+    fn = getattr(report, fn_name, None)
+    if fn is None:
+        return f"report.py has no {fn_name}()."
+    import contextlib
+    import io
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            if fn_name == "show_client":
+                if not client_ip:
+                    return ("Enter a client address first.\n"
+                            "The full window has a field for it -- open it with "
+                            "Enter or a middle-click.")
+                fn(c, client_ip)
+            else:
+                fn(c, *extra)
+    except Exception as exc:
+        return f"That report failed: {exc}"
+    return buf.getvalue().rstrip() or "Nothing to show."
+
+
+# ---------------------------------------------------------------------------
+# GTK pieces
+# ---------------------------------------------------------------------------
+class TrayPopup(Gtk.Window):
+    """A small report panel that drops down from the tray icon.
+
+    Not a taskbar window of its own: no titlebar, sits flush under the panel,
+    skipped from the window list (skip_taskbar_hint), and does not steal focus
+    from whatever you were doing. So it reads as part of the tray rather than as
+    "another window that opened", which is the point of showing the report from
+    the icon.
+
+    A Gtk.Window rather than a Gtk.Menu because menus cannot hold monospaced,
+    selectable text reliably across GTK versions, and a report is text meant to
+    be read and copied, not clicked.
+    """
+
+    def __init__(self, app):
+        # TOPLEVEL, not POPUP: see show_at() for why a typed popup cannot be
+        # mapped from a tray icon. Gtk.WindowType only offers POPUP and TOPLEVEL
+        # in GTK3, and TOPLEVEL is the one that maps without a parent window.
+        # skip-taskbar/pager plus keep-above are what stop it behaving like an
+        # ordinary window, so it still reads as part of the tray.
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.app = app
+        self.current = VIEWS[0][0]
+        self._client = ""
+        # Type hint UTILITY, and deliberately NOT DOCK.
+        #
+        # DOCK is what GTK uses for real panels, and it was the wrong choice
+        # here: GNOME treats a DOCK surface as always-on-top spanning whatever
+        # strip it wants, and placed ours across the top bar -- so the popup
+        # covered the very tray icon that opened it, and the icon appeared to
+        # vanish. It also made the panel unmovable, so it sat at 0,0.
+        #
+        # UTILITY is the right type for a transient panel: no decorations, not
+        # in the taskbar or a workspace switcher, and positioned by the client.
+        # It also fixes the original POPUP_MENU failure, where GDK refused to map
+        # the window at all ("Couldn't map as window 0x... as popup because it
+        # doesn't have a parent") -- a tray icon has no parent window to offer.
+        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_keep_above(True)
+        self.set_decorated(False)
+        self.set_resizable(False)
+        self.set_default_size(460, 200)
+
+        # Dark styling with a faint lanlog mark behind the content. The panel is
+        # a real Gtk.Window, so this CSS genuinely applies to it.
+        #
+        # The mark is the lanlog monitor glyph, drawn large and very faint so it
+        # reads as texture rather than as an icon. It is an inline SVG data URI,
+        # so the panel has no external file to depend on and cannot end up
+        # without its background if the project directory moves.
+        mark = (
+            "data:image/svg+xml;base64,"
+            + base64.b64encode(
+                b'<svg xmlns="http://www.w3.org/2000/svg" width="240" '
+                b'height="240" viewBox="0 0 16 16">'
+                b'<g fill="none" stroke="#7aa2f7" stroke-width="0.45" '
+                b'stroke-linecap="round" stroke-linejoin="round" opacity="0.13">'
+                b'<rect x="1.5" y="3" width="13" height="8" rx="1"/>'
+                b'<path d="M5 13.5h6M8 11v2.5"/></g>'
+                b'<circle cx="8" cy="7" r="1.6" fill="#7aa2f7" opacity="0.20"/>'
+                b'</svg>').decode()
+        )
+        css = f"""
+        window.lanlog-popup {{
+            background-color: #16181d;
+            background-image: url("{mark}");
+            background-repeat: no-repeat;
+            /* GTK's background-position takes at most "where", not per-edge
+               offsets -- a value like "right -30px bottom -40px" is a parse
+               error ("Junk at end of value for background-position") and makes
+               load_from_data raise, so the whole provider is dropped. Anchoring
+               at the right edge is enough; the mark is a background texture and
+               its exact offset is cosmetic. */
+            background-position: right center;
+            color: #dfe3ea;
+            border: 1px solid #333842;
+            border-radius: 10px;
+        }}
+        .lanlog-title  {{ color: #7aa2f7; font-weight: bold; padding: 2px 0; }}
+        .lanlog-status {{ color: #9aa3b2; font-size: 90%; padding-bottom: 5px; }}
+        .lanlog-body   {{ color: #dfe3ea; font-family: monospace; font-size: 95%; }}
+        .lanlog-hint   {{ color: #6b7280; font-size: 85%; padding-top: 5px; }}
+
+        /* The tab bar. These replace the notebook rules that were here before:
+           a Gtk.Notebook draws its own tab strip from the theme, and none of the
+           selectors that could reach it (notebook > box > header > tabs > tab
+           and every shorter form) could be confirmed to apply, so the strip
+           rendered in the default light theme on this dark window. The bar is
+           now a row of ToggleButtons, which ordinary class selectors match. */
+        .lanlog-tabbar {{ background-color: transparent; }}
+        button.lanlog-tab {{
+            background-image: none;
+            background-color: #23262e;
+            color: #9aa3b2;
+            border: 1px solid #333842;
+            border-radius: 6px;
+            padding: 3px 16px;
+            font-size: 95%;
+            min-width: 74px;
+        }}
+        /* The active tab has to be obvious at a glance, or the two labels read
+           as two buttons with no state. */
+        button.lanlog-tab:checked {{
+            background-image: none;
+            background-color: #303a4d;
+            color: #ffffff;
+            font-weight: bold;
+            border-color: #4a5265;
+        }}
+        button.lanlog-tab:hover {{
+            background-color: #2b3140;
+            color: #dfe3ea;
+        }}
+        .lanlog-body text, textview.lanlog-body {{
+            background-color: transparent;
+            color: #dfe3ea;
+        }}
+        .lanlog-scroll, scrollbar.lanlog-scroll {{
+            background-color: transparent;
+            border: none;
+        }}
+        """
+        prov = Gtk.CssProvider()
+        prov.load_from_data(css.encode())
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        # Without this the CSS class selector above has nothing to match.
+        self.get_style_context().add_class("lanlog-popup")
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        outer.set_border_width(10)
+        self.add(outer)
+
+        self.title = Gtk.Label(xalign=0)
+        self.title.get_style_context().add_class("lanlog-title")
+        outer.pack_start(self.title, False, False, 0)
+
+        self.status = Gtk.Label(xalign=0)
+        self.status.get_style_context().add_class("lanlog-status")
+        self.status.set_ellipsize(Pango.EllipsizeMode.END)
+        outer.pack_start(self.status, False, False, 0)
+
+        # A notebook, so the two things worth seeing live in the one popup.
+        #
+        # A dbusmenu cannot do this: a menu is a flat list of items the host
+        # draws, and it has no notion of a page that stays open. Only this
+        # window can, because it is a real Gtk widget tree we own. The queries
+        # are the first tab because that is what the icon is a fast answer for;
+        # devices replaces what used to be a whole second window.
+        #
+        # Each page owns its own TextView, which is what makes this work at all.
+        # Sharing one buffer between tabs would mean the two views show the same
+        # text, and a refresh would have to re-render the hidden page too.
+        # A hand-built tab bar over a Gtk.Stack, deliberately NOT a Gtk.Notebook.
+        #
+        # A notebook draws its own tab strip from the GTK theme, and no CSS
+        # selector reliably reaches it: every candidate
+        # (notebook > box > header > tabs > tab and the shorter forms) was tried
+        # and none could be confirmed to apply, so the strip came out in the
+        # default light theme on a #16181d window -- present, allocated, mapped,
+        # and effectively invisible. A bar of ordinary ToggleButtons is styled
+        # by rules that do match, so the tabs are legible by construction rather
+        # than by luck.
+        #
+        # One TextView per page, kept in self.pages. Sharing a single view would
+        # mean both tabs showed the same text and a refresh had to re-render the
+        # hidden one too.
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        self.stack.set_vhomogeneous(True)
+        self.pages = {}
+        self.tab_buttons = {}
+        self._syncing_tabs = False
+
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        bar.get_style_context().add_class("lanlog-tabbar")
+        for _key, _label in TABS:
+            btn = Gtk.ToggleButton(label=_label)
+            btn.get_style_context().add_class("lanlog-tab")
+            btn.set_active(_key == TABS[0][0])
+            btn.connect("toggled", self._on_tab_toggled, _key)
+            bar.pack_start(btn, False, False, 0)
+            self.tab_buttons[_key] = btn
+
+            view_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            page_scroll = Gtk.ScrolledWindow()
+            page_scroll.get_style_context().add_class("lanlog-scroll")
+            page_scroll.set_policy(Gtk.PolicyType.NEVER,
+                                  Gtk.PolicyType.AUTOMATIC)
+            page_scroll.set_max_content_height(20 * 18)
+            page_body = Gtk.TextView()
+            page_body.set_editable(False)
+            page_body.set_cursor_visible(False)
+            page_body.set_monospace(True)
+            page_body.get_style_context().add_class("lanlog-body")
+            # Wrapping off so the report keeps its column alignment.
+            page_body.set_wrap_mode(Gtk.WrapMode.NONE)
+            page_scroll.add(page_body)
+            view_box.pack_start(page_scroll, True, True, 0)
+            self.stack.add_named(view_box, _key)
+            self.pages[_key] = (page_body, page_body.get_buffer(), page_scroll)
+
+        outer.pack_start(bar, False, False, 0)
+        outer.pack_start(self.stack, True, True, 0)
+
+        self.hint = Gtk.Label(xalign=0)
+        self.hint.get_style_context().add_class("lanlog-hint")
+        self.hint.set_text("Tab switches page  ·  click the icon or press "
+                           "Esc to close")
+        outer.pack_start(self.hint, False, False, 2)
+
+        self.connect("key-press-event", self._on_key)
+        self.connect("delete-event", lambda *_a: (self.hide(), True)[1])
+        self.connect("button-press-event", self._on_button)
+        # NOTE: there is deliberately NO "hide when focus moves away" handler here.
+        # An earlier version had one, and it hid the panel roughly 180ms after
+        # every show. A tray popup is opened by a click on the icon and never
+        # takes keyboard focus (see show_at), so is_active() is False from the
+        # moment it appears -- the handler could not tell "the user moved on" from
+        # "this panel has never been focused" and always chose the latter. The
+        # panel was created and mapped correctly, then immediately hidden, which
+        # looked identical to it never opening at all.
+
+    # ------------------------------------------------------------------ place
+    def place_under_tray(self, at=None):
+        """Position the popup just below the tray icon.
+
+        `at` is the click position reported by the tray host, which is the most
+        accurate anchor available: it is the exact pixel the user clicked. The
+        live pointer is used when the host did not supply one.
+
+        The panel's own rectangle is tried as a refinement for panels that expose
+        it, but it is not dependable under GNOME on Wayland, where the panel is
+        composited by gnome-shell and no DOCK-typed window appears in GDK's
+        window stack at all. Waybar and similar panels do expose it.
+
+        Nothing in the tray API reports where the icon was drawn, so the click
+        position is the best signal, and it is what this uses.
+        """
+        pw, ph = self.get_size()
+
+        # Where the popup ends up.
+        #
+        # `self.move()` is a request, not a command, and on Wayland a client
+        # cannot position its own toplevel at all -- mutter decides. The one
+        # lever a Wayland client does have is the monitor a toplevel is
+        # associated with, so that is set FIRST, before mapping. Asking for the
+        # monitor under the pointer and then moving is the only way to get a
+        # panel anywhere near the tray on GNOME/Wayland; without it the popup
+        # lands wherever mutter's default is, which on this machine is the far
+        # side of the screen from the icon.
+        want_x = want_y = None
+
+        def monitor_for(px, py):
+            try:
+                display = Gdk.Display.get_default()
+                m = display.get_monitor_at_point(int(px), int(py))
+                return m or display.get_primary_monitor()
+            except Exception:
+                return None
+
+        panel = self._panel_rect()
+        if panel is not None and at is None:
+            x, y, w, h = panel
+            want_x = max(0, x + (w - pw) // 2)
+            want_y = (y + h + 2) if (y <= 4 and h < 200) else max(0, y - ph - 2)
+        else:
+            rx, ry = at if at else (None, None)
+            if rx is None:
+                seat = Gdk.Display.get_default().get_default_seat()
+                pointer = seat.get_pointer() if seat else None
+                ok, rx, ry = (pointer.get_position() if pointer
+                              else (False, 0, 0))
+                if not ok:
+                    rx = ry = None
+            if rx is not None:
+                want_x = rx - pw // 2
+                want_y = ry + 26
+            else:
+                screen = Gdk.Screen.get_default()
+                want_x = max(0, screen.width() - pw - 20)
+                want_y = 40
+
+        mon = monitor_for(want_x, want_y)
+        if mon is not None:
+            try:
+                self.set_screen(mon)
+            except Exception:
+                pass
+            try:
+                gdk_mon = (Gdk.Display.get_default()
+                           .get_monitor_at_point(int(want_x), int(want_y)))
+                if gdk_mon is not None:
+                    self.set_screen(gdk_mon)
+            except Exception:
+                pass
+
+        # Clamp into the monitor's usable area so the popup is never off-screen.
+        try:
+            area = (mon.get_workarea() if mon is not None
+                    else Gdk.Screen.get_default().get_workarea())
+            sx, sy, sw, sh = (area.x, area.y, area.width, area.height)
+        except Exception:
+            screen = Gdk.Screen.get_default()
+            sx, sy, sw, sh = 0, 0, screen.width(), screen.height()
+        x = min(max(sx, want_x), max(sx, sx + sw - pw - 4))
+        y = min(max(sy, want_y), max(sy, sy + sh - ph - 4))
+        self.move(x, y)
+
+    def _panel_rect(self):
+        """The top panel's rectangle, or None if it is not exposed to GDK."""
+        try:
+            screen = Gdk.Screen.get_default()
+            width = screen.width()
+            for win in screen.get_window_stack():
+                if win.get_type_hint() != Gdk.WindowTypeHint.DOCK:
+                    continue
+                x, y = win.get_origin()
+                w, h = win.get_size()
+                if w >= width - 4 and h <= 120 and y <= 4:
+                    return (x, y, w, h)
+        except Exception:
+            pass
+        return None
+
+    # ------------------------------------------------------------------ events
+    def _on_tab_toggled(self, btn, key):
+        """A tab button was clicked: switch pages and relabel the header.
+
+        This delegates to _select_tab rather than doing the work inline,
+        because ToggleButton.set_active() is what clears the other button, and
+        doing that from here re-enters the handler. Clearing it here left BOTH
+        buttons active at once, so Queries still looked selected while Devices
+        was on screen.
+
+        The guard stops the handler from acting on changes it did not cause
+        when load() selects a page programmatically.
+        """
+        if self._syncing_tabs:
+            return False
+        if btn.get_active():
+            self._select_tab(key)
+        return False
+
+    def _select_tab(self, key, render_now=True):
+        """Point the bar and the stack at one page, without recursion."""
+        if key not in self.pages:
+            key = TABS[0][0]
+        self._syncing_tabs = True
+        try:
+            for k, btn in self.tab_buttons.items():
+                btn.set_active(k == key)
+            self.stack.set_visible_child_name(key)
+        finally:
+            self._syncing_tabs = False
+        self.current = key
+        if render_now:
+            c = conn()
+            self.title.set_text(f"lanlog \u2014 {dict(VIEWS).get(key, key)}")
+            self.status.set_text(status_line(c))
+
+    def _on_key(self, _w, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.hide()
+            return True
+        if event.keyval == Gdk.KEY_Tab:
+            n = len(TABS)
+            self._select_tab(TABS[(self._tab_index(self.current) + 1) % n][0])
+            return True
+        if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            # Enter opens the real window: the popup is a glance, the window is
+            # for working through a report.
+            self.hide()
+            self.app.show_window()
+            return True
+        return False
+
+    def _on_button(self, widget, event):
+        if event.type == Gdk.EventType._2BUTTON_PRESS and event.button == 1:
+            self.hide()
+            self.app.show_window()
+            return True
+        return False
+
+    # ------------------------------------------------------------------ content
+    def _restore_scroll_after_layout(self, adj, value):
+        """Re-apply a scroll position once the pending layout has been done.
+
+        set_text() invalidates the layout, and GTK applies the resulting
+        scrollbar reset during the next idle pass -- not synchronously. Writing
+        the value back straight after set_text() therefore looks like it works
+        and then does not: measured, the value was still correct immediately
+        after the call and wrong once the main loop ran.
+
+        An idle callback at low priority runs after the layout, which is the
+        only point at which the value sticks. The comparison matters: if the
+        layout has already put it back where it should be, this does nothing,
+        so it cannot fight a position the user moved in the meantime.
+        """
+        def _apply():
+            if abs(adj.get_value() - value) > 0.5:
+                adj.set_value(value)
+            return False
+
+        GLib.idle_add(_apply, priority=GLib.PRIORITY_LOW)
+
+    def _tab_index(self, view):
+        for i, (key, _l) in enumerate(TABS):
+            if key == view:
+                return i
+        return 0
+
+    def load(self, view=None, client_ip=None, keep_scroll=False):
+        """Render one tab, or all of them on a refresh.
+
+        keep_scroll=True is the refresh path. Two rules make it flicker-free:
+
+          * Only write to a buffer when the text actually differs. set_text
+            invalidates the whole layout, so writing identical text 20 times a
+            minute makes GTK re-lay-out and re-paint for no reason -- and that
+            repaint is what the eye catches as the panel blinking.
+          * Never move a scrollbar. Resetting to 0 is right when the user
+            switches tabs and wrong when data merely arrives: the list would
+            yank itself back to the top while the user was reading further
+            down.
+
+        The scroll value is saved and restored around the write, because a
+        buffer change can reset an adjustment as a side effect even when the
+        code never asks for it.
+
+        One trap, and it took a measurement to see. set_text() does not reset
+        the scrollbar when it returns -- the reset arrives during the *next*
+        layout pass, so a value restored immediately after set_text() is
+        silently overwritten a few milliseconds later. Observed directly: value
+        177 before set_text, still 177 right after it, then 17 once the main
+        loop ran, with 17 being the adjustment's own default. A restore in the
+        same function as the write therefore does nothing at all.
+
+        So the position is re-applied from an idle callback, which runs after
+        the layout that would have clobbered it. The callback is the only place
+        the restore actually takes effect.
+        """
+        if view is not None:
+            self.current = view
+        if client_ip is not None:
+            self._client = client_ip
+
+        # A view that is not a tab (a report reached from the menu) is rendered
+        # into the first tab rather than refused, so the popup always shows
+        # something coherent instead of a blank page.
+        target = view if view in dict(TABS) else TABS[0][0]
+        idx = self._tab_index(target)
+
+        c = conn()
+        label = dict(VIEWS).get(target, target)
+        self.title.set_text(f"lanlog \u2014 {label}")
+        self.status.set_text(status_line(c))
+
+        keys = [target] if view is not None else [k for k, _l in TABS]
+        for key in keys:
+            page = self.pages.get(key)
+            if page is None:
+                continue
+            _view, buf, scroll = page
+            text = render(c, key, self._client)
+            adj = scroll.get_vadjustment()
+            # upper > 0 means this tab has been through a real layout. A tab
+            # that has never been shown legitimately has upper == 0, and there
+            # is no position to preserve.
+            laid_out = adj.get_upper() > 0
+            saved = adj.get_value()
+            if buf.get_text(buf.get_start_iter(),
+                            buf.get_end_iter(), False) != text:
+                buf.set_text(text)
+            if keep_scroll:
+                if laid_out:
+                    self._restore_scroll_after_layout(adj, saved)
+            elif key == target:
+                # Switching pages starts at the top; refreshing does not.
+                adj.set_value(0)
+
+        if not keep_scroll and self.stack.get_visible_child_name() != target:
+            # Only when it actually differs: set_visible_child_name on the page
+            # already showing still triggers a relayout, which is one of the
+            # things that reads as a blink on a refresh.
+            self._select_tab(target, render_now=False)
+
+    def refresh_if_shown(self):
+        """Re-render in place, without the blink.
+
+        load() used to be called unconditionally here, and two things in it
+        moved on every tick: the whole buffer was replaced with set_text, and
+        the scrollbar was reset to 0. The window never actually hid -- that
+        was measured, no visibility signal fired during a refresh -- but a full
+        re-layout plus a jump to the top every 3 seconds reads to the eye as
+        "it closed and came back", which is exactly what it looked like.
+
+        So: skip the redraw when the text is unchanged, and never touch the
+        scroll position during a refresh. The scroll-to-top belongs to
+        switching views, which is a deliberate act, not to data arriving.
+        """
+        if not self.get_visible():
+            return
+        self.load(keep_scroll=True)
+
+    def toggle(self):
+        if self.get_visible():
+            self.hide()
+        else:
+            self.show_at(self.current)
+
+    def show_at(self, view, at=None):
+        """Show the popup with this report in it.
+
+        A window with WindowType.POPUP is a pure menu surface: it has no title
+        bar, it is not decorated, and GDK refuses to map it unless a parent
+        window exists -- and a tray icon has no parent window to offer. That
+        refusal is silent: the click registers, the report renders, and the panel
+        never appears.
+
+        The window is therefore created TOPLEVEL and carries a UTILITY type hint
+        (see __init__), which is what a transient report panel uses, then moved
+        to anchor under the icon.
+        """
+        self.load(view)
+        if not self.get_visible():
+            # A DOCK-typed, undecorated window does not get sized the way a
+            # normal toplevel does: with no title bar there is nothing for the
+            # WM to derive a size from, and it can map at 1x1 or not at all. Give
+            # it an explicit allocation first so there is real content to show.
+            self.set_size_request(*POPUP_SIZE)
+            self.show_all()
+            # Position AFTER the surface exists. A DOCK-typed window is placed by
+            # the compositor, and the client-requested position only sticks once
+            # the window is realized -- moving it before that is discarded, which
+            # is what left the panel at 0,0.
+            self.realize()
+            self.place_under_tray(at)
+        if os.environ.get("LANLOG_TRAY_DEBUG"):
+            # Report whether the window actually mapped. get_mapped() is False
+            # when GDK refused to map it, which is the failure that looks
+            # identical to "nothing happened" from the user's side.
+            #
+            # The pixbuf read is the real proof of life: a mapped window can
+            # still be entirely blank, and a window that never painted has no
+            # pixels to sample. If this reports a non-zero size with real
+            # content, GTK genuinely drew the report and the problem is
+            # visibility/placement, not rendering.
+            #
+            # GdkWaylandWindow has no get_pixbuf (that is X11-only), so the
+            # render is proven on the Gtk.Widget instead: a realized widget with
+            # a non-zero allocation is one the WM has actually sized.
+            try:
+                painted = (f"alloc={self.get_allocation().width}x"
+                           f"{self.get_allocation().height} realized="
+                           f"{self.get_realized()} gdkwin="
+                           f"{self.get_window() is not None}")
+            except Exception as exc:
+                painted = f"ERR {exc!r}"
+            print(f"lanlog-tray: popup show requested; visible="
+                  f"{self.get_visible()} mapped={self.get_mapped()} "
+                  f"pos={self.get_position()} size={self.get_size()} "
+                  f"painted={painted}",
+                  file=sys.stderr, flush=True)
+        # Deliberately no grab_focus(). The popup is a glance, not a typing
+        # target: it holds no entry the user needs to fill, and taking keyboard
+        # focus would pull it away from whatever window you were working in --
+        # which is exactly what a tray popup must not do. It also leaves Esc to
+        # the panel only while it happens to hold focus, so dismissal is handled
+        # by clicking away (the panel sits under the pointer) plus the icon
+        # itself acting as a toggle.
+
+
+class TrayWindow(Gtk.Window):
+    """The full report window, for working through a report properly.
+
+    This is where the client IP field lives, which the popup deliberately does
+    not have.
+    """
+
+    def __init__(self, app):
+        super().__init__(title="lanlog")
+        self.app = app
+        self.current = VIEWS[0][0]
+        self.set_default_size(780, 560)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        outer.set_border_width(10)
+        self.add(outer)
+
+        self.status = Gtk.Label(xalign=0)
+        self.status.get_style_context().add_class("lanlog-status")
+        outer.pack_start(self.status, False, False, 0)
+
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        for key, label in MENU_LABELS:
+            b = Gtk.Button(label=label)
+            b.connect("clicked", self._on_view, key)
+            btns.pack_start(b, False, False, 0)
+        outer.pack_start(btns, False, False, 0)
+
+        self.client_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.client_row.pack_start(Gtk.Label(label="Client IP:"), False, False, 0)
+        self.client_entry = Gtk.Entry()
+        self.client_entry.set_placeholder_text("192.168.1.1")
+        self.client_entry.connect("activate", lambda *_a: self._load())
+        self.client_row.pack_start(self.client_entry, True, True, 0)
+        outer.pack_start(self.client_row, False, False, 0)
+        self.client_row.set_visible(self.current == "client")
+
+        self.scroll = Gtk.ScrolledWindow()
+        self.text = Gtk.TextView()
+        self.text.set_editable(False)
+        self.text.set_monospace(True)
+        self.text.set_wrap_mode(Gtk.WrapMode.NONE)
+        self.scroll.add(self.text)
+        outer.pack_start(self.scroll, True, True, 0)
+
+        self.connect("delete-event", lambda *_a: (self.hide(), True)[1])
+
+    def _on_view(self, _btn, key):
+        self.current = key
+        self.client_row.set_visible(key == "client")
+        self._load()
+
+    def _load(self, *_a):
+        c = conn()
+        self.status.set_text(status_line(c))
+        self.text.get_buffer().set_text(
+            render(c, self.current, self.client_entry.get_text()))
+
+    def refresh(self):
+        if self.get_visible():
+            self._load()
+
+
+# ---------------------------------------------------------------------------
+# The StatusNotifierItem, exported by hand so a left-click reaches us.
+# ---------------------------------------------------------------------------
+WATCHER_BUS = "org.kde.StatusNotifierWatcher"
+WATCHER_PATH = "/StatusNotifierWatcher"
+# A fresh object path and Id.
+#
+# gnome-shell's appindicator extension caches each item's properties -- including
+# whether it behaves as a menu -- for the lifetime of the shell session, keyed by
+# Id. This item was first registered while GetLayout was throwing, so the host
+# classified it as a plain menu icon and swallowed left-clicks. That cache
+# outlives the process, so fixing the menu in code does not clear it: the same
+# Id keeps its stale menu-icon classification until the shell itself restarts.
+#
+# Using a new Id makes the host treat it as a never-seen item and read the
+# (now correct) properties fresh. Bumping this string is therefore the fix when
+# menu-related behaviour will not change in an already-running shell.
+SNI_ID = "lanlog-panel3"
+ITEM_PATH = "/org/ayatana/NotificationItem/lanlog_panel2"
+MENU_PATH = "/MenuBar"
+
+# Default popup size. Also set as an explicit allocation before showing,
+# because an undecorated DOCK window has no title bar for the WM to derive a
+# size from and can otherwise map with no usable size.
+POPUP_SIZE = (608, 200)
+
+ITEM_XML = """<node>
+ <interface name="org.kde.StatusNotifierItem">
+  <method name="Activate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+  <method name="SecondaryActivate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+  <method name="Scroll"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+  <method name="ContextMenu"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+  <property name="Category" type="s" access="read"/>
+  <property name="Id" type="s" access="read"/>
+  <property name="Title" type="s" access="read"/>
+  <property name="Status" type="s" access="read"/>
+  <property name="IconName" type="s" access="read"/>
+  <property name="ItemIsMenu" type="b" access="read"/>
+  <property name="Menu" type="o" access="read"/>
+ </interface>
+</node>"""
+
+MENU_XML = """<node>
+ <interface name="com.canonical.dbusmenu">
+  <method name="GetLayout">
+   <arg type="i" direction="in"/><arg type="i" direction="in"/>
+   <arg type="as" direction="in"/><arg type="u" direction="out"/>
+   <arg type="(ia{sv}av)" direction="out"/>
+  </method>
+  <method name="GetGroupProperties">
+   <arg type="as" direction="in"/><arg type="as" direction="in"/>
+   <arg type="a(ia{sv})" direction="out"/>
+  </method>
+  <method name="GetProperty">
+   <arg type="i" direction="in"/><arg type="s" direction="in"/>
+   <arg type="v" direction="out"/>
+  </method>
+  <method name="Event"><arg type="i" direction="in"/><arg type="s" direction="in"/>
+   <arg type="v" direction="in"/><arg type="u" direction="in"/><arg type="u" direction="out"/></method>
+  <method name="AboutToShow"><arg type="i" direction="in"/><arg type="b" direction="out"/></method>
+  <method name="Introspect"><arg type="i" direction="in"/><arg type="s" direction="out"/></method>
+  <signal name="LayoutUpdated"><arg type="u"/><arg type="i"/></signal>
+ </interface>
+</node>"""
+
+APP = None
+ITEM = None
+_LOOP = None
+
+
+def _typed(value):
+    """Wrap a Python str as a D-Bus string, leaving every other type alone.
+
+    dbus.ObjectPath and dbus.Boolean are both SUBCLASSES of dbus.String in
+    dbus-python, so an `isinstance(v, str)` test also catches Menu (an object
+    path) and re-wraps it as a plain string. The wire signature then says 's'
+    where the SNI spec says 'o', and the panel rejects the whole item:
+
+        Received property Menu with type s does not match expected type o
+
+    quickshell's SNI host drops the item at that point, so the tray shows
+    nothing at all while the item is still registered with the watcher. Ordering
+    the checks by exact type is what keeps ObjectPath an ObjectPath.
+    """
+    if type(value) is str:
+        return dbus.String(value)
+    return value
+
+
+def _quit(*_a):
+    if _LOOP is not None:
+        _LOOP.quit()
+    return False
+
+
+class StatusNotifierItem(dbus.service.Object):
+    """The tray item.
+
+    The Menu / ItemIsMenu pairing is the whole trick and both halves are needed:
+      Menu="/" and no real menu     -> host treats it as menu-backed, shows a menu
+      no Menu property at all       -> registers, but a left-click does nothing
+      real menu + ItemIsMenu=false  -> left-click sends Activate, menu on right
+    """
+
+    def __init__(self, bus, app):
+        self.app = app
+        self.icon, self.icon_problem = resolve_icon()
+        self._props = {
+            "Category": "ApplicationStatus",
+            "Id": SNI_ID,
+            "Title": "lanlog",
+            "Status": "Active",
+            "IconName": self.icon,
+            # False is what makes a left-click activate instead of opening the
+            # menu. Without it the host always shows the menu and the popup can
+            # never appear.
+            "ItemIsMenu": dbus.Boolean(False),
+            "Menu": dbus.ObjectPath(MENU_PATH),
+        }
+        dbus.service.Object.__init__(self, bus, ITEM_PATH)
+
+    # --------------------------------------------------------------- methods
+    @dbus.service.method("org.kde.StatusNotifierItem", in_signature="ii",
+                         out_signature="")
+    def Activate(self, x, y):
+        # Double click: the tabbed popup. The (0,0) fallback for hosts that send
+        # no real coordinates lives in open_popup(), shared with the middle
+        # click so both behave identically.
+        if os.environ.get("LANLOG_TRAY_DEBUG"):
+            print(f"lanlog-tray: Activate({x},{y})", file=sys.stderr, flush=True)
+        self.app.on_activate(x, y)
+
+    @dbus.service.method("org.kde.StatusNotifierItem", in_signature="ii",
+                         out_signature="")
+    def SecondaryActivate(self, x, y):
+        """Middle click: the same tabbed popup a double left click gives.
+
+        This is the only single-press left-click-equivalent on this host. The
+        GNOME appindicator extension's vfunc_button_press_event decides between
+        the menu and Activate() before the app is ever consulted, and a single
+        press can only ever reach menu.toggle(): Activate() fires when its
+        internal click count hits 2, and with an empty menu a single press does
+        nothing at all. Verified by extracting that logic and running it against
+        every combination of menu size and Activate support. So the left button
+        is the query menu and middle is the tabbed popup; there is no way to
+        give the tabbed popup the left button without editing the extension.
+        """
+        self.app.on_activate(x, y)
+
+    @dbus.service.method("org.kde.StatusNotifierItem", in_signature="ii",
+                         out_signature="b")
+    def Scroll(self, delta, orientation):
+        return bool(self.app.on_scroll(delta, orientation))
+
+    @dbus.service.method("org.kde.StatusNotifierItem", in_signature="ii",
+                         out_signature="")
+    def ContextMenu(self, x, y):
+        self.app.on_activate()
+
+    # ------------------------------------------------------------- properties
+    @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="ss",
+                         out_signature="v")
+    def Get(self, iface, prop):
+        return _typed(self._props.get(prop, ""))
+
+    @dbus.service.method("org.freedesktop.DBus.Properties", in_signature="s",
+                         out_signature="a{sv}")
+    def GetAll(self, iface):
+        return self._as_variants()
+
+    @dbus.service.method("org.freedesktop.DBus.Introspectable", in_signature="",
+                         out_signature="s")
+    def Introspect(self, *a):
+        return dbus.String(ITEM_XML)
+
+    @dbus.service.signal("org.freedesktop.DBus.Properties",
+                         signature="sa{sv}as")
+    def PropertiesChanged(self, iface, changed, invalidated):
+        pass
+
+    def _as_variants(self):
+        return {k: _typed(v) for k, v in self._props.items()}
+
+    def update_tooltip(self):
+        """Nudge the host to re-read the properties.
+
+        The status line deliberately does NOT go into Title. Title is what the
+        panel shows as the item's accessible name, and the status line contains
+        separators and runs long; putting it there replaced the clean "lanlog"
+        with a multi-line string (observed as Title: '7\\n...') and a left-click
+        stopped activating entirely. A plain, stable Title is required for the
+        one-click behaviour to work at all.
+        """
+        try:
+            self.PropertiesChanged("org.kde.StatusNotifierItem",
+                                   self._as_variants(), [])
+        except Exception:
+            pass
+
+
+class DbusMenu(dbus.service.Object):
+    """A real dbusmenu, so the host stays satisfied and keeps a right-click menu.
+
+    Required by the ItemIsMenu=false pairing: without an exported menu the host
+    registers the item but a left-click does nothing.
+
+    The items are the LIVE QUERY FEED, not the list of reports. That is a
+    deliberate change from the obvious design, and it is forced by how the host
+    actually behaves: a single click on the icon opens this menu, and only a
+    double-click, or a click on a menu entry, reaches the popup. The host
+    decides that, not us -- the extension's button-press handler owns the single
+    click and only forwards a double one. So if the menu is a list of report
+    names, a single click shows a list of report NAMES, and the user has to
+    click again to see anything. Putting the queries in the menu means one
+    click answers the question -- "what is happening right now" -- and the
+    reports are still there underneath for anyone who wants them.
+
+    The menu is rebuilt from the database every time it is about to be shown,
+    because a menu cached at startup would show the queries from whenever the
+    tray was launched, which is the opposite of live.
+    """
+
+    def __init__(self, bus, app):
+        self.app = app
+        self._ids = {}
+        self._rev = 0
+        dbus.service.Object.__init__(self, bus, MENU_PATH)
+        # NOTE ON STYLING: there is deliberately no CSS or Gtk widget here.
+        #
+        # A dbusmenu is not a Gtk.Menu -- it is a D-Bus description that the
+        # tray host reads and then draws with its OWN widgets and its OWN
+        # stylesheet. There is no widget of ours to attach a style context to, so
+        # any Gtk.CssProvider added here would apply to our own windows and do
+        # nothing to the popup the user actually sees.
+        #
+        # The menu's appearance is therefore the host's to decide. The one thing
+        # that does reach it is the "type" property in _props_for, which selects
+        # the host's own item rendering. Making the menu look a specific way
+        # would mean replacing the host's menu rendering with a window of our own
+        # -- which is what TrayPopup is, and which the one-click Activate() path
+        # already opens. So the dark theme and the background mark belong on
+        # TrayPopup, where there is a real widget to style.
+
+    # How many recent queries the menu shows. Kept modest: a dbusmenu drawn by
+    # the host has no height constraint we control, and a menu taller than the
+    # screen scrolls instead of being usable.
+    MENU_QUERY_ROWS = 8
+
+    # Characters of a menu row available for the device, after the blocked
+    # marker. Shared with _rebuild so the width that a label is fitted to and
+    # the width it is tested against cannot drift apart.
+    MENU_LABEL_W = 18
+
+    def _rebuild(self):
+        """Re-read the feed and reassign every menu id. Called before each show.
+
+        Ids are reused deliberately. A dbusmenu host caches item properties by
+        id, so handing out fresh ids every open makes it re-fetch labels for
+        rows that are still the same row; keeping the numbering stable lets it
+        keep the cache. The revision is bumped anyway so a host that does
+        re-fetch is told to.
+        """
+        entries = []
+        try:
+            c = conn()
+        except Exception:
+            c = None
+        if c is not None:
+            try:
+                rows = report.latest_rows(c, self.MENU_QUERY_ROWS)
+                names = report.identify.describe_all(c)
+                # Honour the same `labels` setting the terminal dashboard uses,
+                # so the tray and the CLI cannot show two different things for
+                # the same device. A dbusmenu row is one line of text, so `both`
+                # is truncated hard and `ip` mode is what makes the address
+                # readable when a name will not fit.
+                label_mode = report._label_mode()
+            except Exception:
+                rows, names, label_mode = [], {}, "names"
+        else:
+            rows, names, label_mode = [], {}, "names"
+
+        if rows:
+            for r in rows:
+                label = report._label({"ip": r["client"]}, names, label_mode)
+                # A menu row is 18 characters, which a name plus its address
+                # cannot both fit into. In `both` mode the address is the half
+                # that gets cut, and it is the half the mode exists to show, so
+                # the row falls back to the bare address rather than displaying
+                # a name with the useful part silently chopped off.
+                if label_mode == "both" and len(label) > self.MENU_LABEL_W:
+                    label = r["client"]
+                # A leading marker is the whole point: in a plain menu the only
+                # place to say "this one was blocked" is the text itself.
+                mark = "■ " if r["blocked"] else "· "
+                # The device goes in the label too. The popup and window have a
+                # column for it; a menu has exactly one line of text, so this is
+                # the only place a one-click view can show who asked.
+                entries.append((
+                    f"{mark}{label[:self.MENU_LABEL_W]:<{self.MENU_LABEL_W}} "
+                    f"{r['qname'][:40]}",
+                    "query",
+                    r["client"],
+                ))
+        else:
+            entries.append((
+                "no queries recorded yet" if c is not None
+                else "no database yet -- start the logger",
+                "info", "",
+            ))
+
+        # NO report entries and NO quit. The menu is now purely the query feed.
+        #
+        # The reports live in the popup's tabs and in the full window, both
+        # reachable from the icon, so a list of report names here duplicated
+        # them while being the one thing standing between a single click and
+        # the data. A menu that only answers "what just happened" is worth
+        # having; a menu that is mostly navigation is not.
+        #
+        # Quit is gone from here on purpose. The panel is dismissed with Esc or
+        # a click on the icon, and quitting the tray is a terminal task --
+        # pkill lanlog-tray. Leaving a quit row also meant an accidental click
+        # near the top of the list could kill the icon, since the rows shift as
+        # new queries arrive and a memorised position is not a safe one.
+
+        self._ids = {i: e for i, e in enumerate(entries, start=1)}
+        self._rev += 1
+        return self._ids
+
+    def _props_for(self, item_id):
+        entry = self._ids.get(item_id)
+        if entry is None:
+            return dbus.Dictionary({}, signature="sv")
+        label, kind, _extra = entry
+        props = {
+            "label": dbus.String(label),
+            "enabled": dbus.Boolean(kind not in ("separator", "info")),
+            "visible": dbus.Boolean(True),
+            # type="standard" is required for the left-click to arrive here.
+            # Observed both ways on this machine: with it, Activate() fires on
+            # a single click; without it, every single click is swallowed.
+            "type": dbus.String("standard"),
+        }
+        if kind == "separator":
+            props["type"] = dbus.String("separator")
+        return dbus.Dictionary(props, signature="sv")
+
+    @dbus.service.method("com.canonical.dbusmenu", in_signature="iias",
+                         out_signature="u(ia{sv}av)")
+    def GetLayout(self, parent, depth, names):
+        # Every level needs an explicit signature. A bare Python list or dict has
+        # no signature for dbus-python to infer, and the reply then fails to
+        # marshal ("Unable to guess signature from an empty list"). The Struct
+        # signature must match the method's out_signature, i.e. (ia{sv}av).
+        #
+        # The guard matters because a host calls GetLayout at registration time,
+        # long before any menu is shown. Without a build here the first reply is
+        # an empty layout, and hosts treat that as a broken menu.
+        if not self._ids:
+            self._rebuild()
+        children = dbus.Array(
+            [dbus.Struct(
+                (dbus.Int32(i),
+                 self._props_for(i),
+                 dbus.Array([], signature="v")),
+                signature="(ia{sv}av)")
+             for i in sorted(self._ids)],
+            signature="(ia{sv}av)")
+        return (dbus.UInt32(self._rev),
+                (dbus.Int32(0), dbus.Dictionary({}, signature="sv"), children))
+
+    @dbus.service.method("com.canonical.dbusmenu", in_signature="aias",
+                         out_signature="a(ia{sv})")
+    def GetGroupProperties(self, ids, names):
+        return dbus.Array(
+            [dbus.Struct((dbus.Int32(i), self._props_for(i)),
+                         signature="(ia{sv})")
+             for i in ids],
+            signature="(ia{sv})")
+
+    @dbus.service.method("com.canonical.dbusmenu", in_signature="is",
+                         out_signature="v")
+    def GetProperty(self, item_id, name):
+        props = self._props_for(item_id)
+        if name not in props:
+            return dbus.String("")
+        return _typed(props[name])
+
+    @dbus.service.method("com.canonical.dbusmenu", in_signature="isvu",
+                         out_signature="u")
+    def Event(self, item_id, event_id, data, timestamp=0):
+        # "clicked" on a report item opens that report in the popup.
+        #
+        # The 4th argument is the X event timestamp and it is NOT optional in
+        # the spec. Declaring only 3 in-args makes every real host call fail the
+        # signature check, so the click is discarded before it reaches this
+        # body: the menu highlights, then closes, and no report appears. Hosts
+        # that introspect the method to decide how to call it will also build
+        # the wrong call. The default keeps hand-rolled 3-arg probes working.
+        if os.environ.get("LANLOG_TRAY_DEBUG"):
+            print(f"lanlog-tray: menu Event({item_id}, {event_id!r}, "
+                  f"ts={timestamp})", file=sys.stderr, flush=True)
+        if event_id in ("clicked", "pressed", "hovered"):
+            entry = self._ids.get(item_id)
+            if entry:
+                _label, kind, extra = entry
+                if kind == "quit":
+                    self.app.quit()
+                elif kind == "view":
+                    # A report name opens in the full window, not the popup. The
+                    # popup is for the live feed; a ranked report is worth more
+                    # room than a dropdown gives it.
+                    self.app.show_window(extra)
+                elif kind == "query":
+                    # Clicking a query opens the popup on the devices tab.
+                    # A new window per click is the thing this whole redesign
+                    # removed, so following a row must not bring one back: the
+                    # row already names a device, and the devices tab is the
+                    # one place that shows who is on the network.
+                    self.app.popup.show_at("devices")
+        return 0
+
+    @dbus.service.method("com.canonical.dbusmenu", in_signature="i",
+                         out_signature="b")
+    def AboutToShow(self, item_id):
+        """Rebuild, then tell the host the layout changed so it re-fetches.
+
+        Returning True is the dbusmenu way of saying "the layout is now
+        different, call GetLayout again". Returning False with a rebuilt menu is
+        the trap: the host keeps drawing the labels it cached at registration,
+        so the menu shows whatever happened to be in the database when the tray
+        started and silently stops updating.
+        """
+        self._rebuild()
+        return True
+
+    @dbus.service.method("com.canonical.dbusmenu", in_signature="i",
+                         out_signature="s")
+    def Introspect(self, item_id):
+        return MENU_XML
+
+    @dbus.service.method("org.freedesktop.DBus.Introspectable", in_signature="",
+                         out_signature="s")
+    def IntrospectDbus(self, *a):
+        return MENU_XML
+
+    @dbus.service.signal("com.canonical.dbusmenu", signature="ui")
+    def LayoutUpdated(self, revision, parent):
+        pass
+
+
+class LanlogApp:
+    """Holds the popup and window, and the handlers the D-Bus item calls."""
+
+    def __init__(self):
+        self.win = TrayWindow(self)
+        self.popup = TrayPopup(self)
+
+    def quit(self):
+        """Shut down cleanly from the menu.
+
+        Closing the windows is not enough on its own: this app is kept alive by
+        the D-Bus GLib main loop, not by a visible window, so hiding everything
+        would leave a process running with no icon and no way to reach it. The
+        autostart entry would then refuse to start a second copy, and the tray
+        would be permanently dead until a logout. Unregister the name, then
+        leave the main loop.
+        """
+        try:
+            self.item.unregister()
+        except Exception:
+            pass
+        for w in (self.popup, self.win):
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        Gtk.main_quit()
+
+    def on_activate(self, x=None, y=None, *_a):
+        """Open the tabbed popup, or dismiss it if it is already up.
+
+        Reached from Activate (double left click) and SecondaryActivate (middle
+        click). Both share this one path so the two routes cannot drift: an
+        earlier version gave the SNI item its own open_popup() helper and it
+        raised AttributeError on every click, because the popup lives on the
+        app and not on the status-notifier item.
+        """
+        if os.environ.get("LANLOG_TRAY_DEBUG"):
+            print(f"lanlog-tray: on_activate at ({x},{y})", file=sys.stderr,
+                  flush=True)
+        at = (x, y) if x and y and x > 0 and y > 0 else None
+        try:
+            if self.popup.get_visible():
+                self.popup.hide()
+            else:
+                self.popup.show_at(self.popup.current, at)
+        except Exception as exc:
+            print(f"lanlog-tray: popup failed: {exc!r}", file=sys.stderr,
+                  flush=True)
+            import traceback
+            traceback.print_exc()
+
+    def on_scroll(self, delta, orientation):
+        """Scroll switches popup tabs without closing the popup.
+
+        Cycles the popup's TABS, not VIEWS. Scrolling used to walk the whole
+        report list, which meant a single flick could replace the live feed
+        with a ranking and leave it there; the tabs are the short list, and
+        flicking between Queries and Devices is the only thing a glance needs.
+        """
+        # Orientation 0 is vertical. Only vertical scrolling changes the page,
+        # so a horizontal flick does nothing.
+        if orientation != 0:
+            return True
+        n = len(TABS)
+        # popup.current is the single source of truth, not the notebook page.
+        # Reading get_current_page() instead is the bug this comment replaced:
+        # when the popup is closed the notebook still holds whatever page it was
+        # last on, which is stale the moment anything else changes current, and
+        # two flicks in a row would resolve to the same tab. load() and the
+        # switch-page handler both keep current in step with what is on screen.
+        cur = self.popup._tab_index(self.popup.current)
+        step = 1 if delta > 0 else -1
+        self.popup.show_at(TABS[(cur + step) % n][0])
+        return True
+
+    def show_window(self, view=None, client_ip=None):
+        # client_ip is pre-filled from a menu row rather than typed. The value
+        # goes into the entry widget, which is where _load() reads it from --
+        # TrayWindow has no separate attribute to stash it in, and inventing one
+        # would leave the entry and the report disagreeing on the first manual
+        # edit.
+        if view is not None:
+            self.win.current = view
+        self.win.client_row.set_visible(view == "client")
+        if client_ip is not None:
+            self.win.client_entry.set_text(client_ip)
+        self.popup.hide()
+        self.win.show_all()
+        self.win._load()
+        self.win.present()
+
+    def tick(self):
+        for fn in (ITEM.update_tooltip if ITEM else None,
+                   self.popup.refresh_if_shown, self.win.refresh):
+            if fn is None:
+                continue
+            try:
+                fn()
+            except Exception:
+                pass
+        return True
+
+
+def main():
+    global APP, ITEM, _LOOP
+    args = sys.argv[1:]
+
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SessionBus()
+
+    APP = LanlogApp()
+    ITEM = StatusNotifierItem(bus, APP)
+    if ITEM.icon_problem:
+        print(f"lanlog-tray: warning: {ITEM.icon_problem}", file=sys.stderr)
+        print("  the tray icon may not display. The window still works:",
+              file=sys.stderr)
+        print("  run it with a --window argument to open the report window.",
+              file=sys.stderr)
+
+    # A well-known name is not required -- the watcher registers the object path
+    # against our unique connection -- but taking one makes the item easy to
+    # inspect with busctl.
+    bus_name = dbus.service.BusName(f"org.kde.StatusNotifierItem-{os.getpid()}-1",
+                                    bus)
+    menu_obj = DbusMenu(bus, APP)          # keep referenced
+
+    def register():
+        try:
+            watcher = bus.get_object(WATCHER_BUS, WATCHER_PATH)
+            iface = dbus.Interface(watcher, "org.kde.StatusNotifierWatcher")
+            iface.RegisterStatusNotifierItem(
+                ITEM_PATH,
+                reply_handler=lambda *a: None,
+                error_handler=lambda e: print(
+                    f"lanlog-tray: could not register with the tray host: {e}\n"
+                    "  the reports still work:  lanlog-tray --window",
+                    file=sys.stderr))
+        except Exception as exc:
+            print(f"lanlog-tray: tray registration failed: {exc}",
+                  file=sys.stderr)
+            print("  the reports still work:  lanlog-tray --window",
+                  file=sys.stderr)
+        return False
+
+    GLib.timeout_add(400, register)
+    GLib.timeout_add(POPUP_REFRESH_MS, APP.tick)
+
+    if "--window" in args:
+        APP.show_window()
+
+    _LOOP = GLib.MainLoop()
+    _LOOP.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

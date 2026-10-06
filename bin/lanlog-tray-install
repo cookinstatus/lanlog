@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# Install a system tray host, if this desktop needs one.
+#
+# Only called after the live check reported that nothing on the session bus is
+# providing a StatusNotifierWatcher. That check is what decides whether a tray
+# icon can appear at all, so this script only has one job: get something
+# providing that interface.
+#
+# The right answer depends entirely on the desktop, because some ship a tray and
+# some never will:
+#
+#   GNOME      no tray of its own. Needs the AppIndicator extension, which is a
+#              software install but also needs a logout/login to take effect.
+#   KDE        has one already; if we are here, the session is unusual.
+#   Hyprland / Sway / i3 / river / niri   no tray at all by design. A tray host
+#              has to be added, and on Hyprland that is normally a Waybar tray
+#              module or a standalone host like Stalonray.
+#   XFCE / Cinnamon / MATE   have panels with a tray; usually a config issue
+#              rather than a missing package.
+#
+# Installing a config file for someone else's window manager is not something to
+# do silently, so this prints the commands and asks before writing anything.
+set -euo pipefail
+
+PKGFAM=""
+if [ -r /etc/os-release ]; then
+    ID=$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"')
+    LIKE=$(sed -n 's/^ID_LIKE=//p' /etc/os-release | tr -d '"')
+    case "${ID} ${LIKE}" in
+        *fedora*|*rhel*)   PKGFAM=fedora ;;
+        *debian*)          PKGFAM=debian ;;
+        *arch*)            PKGFAM=arch ;;
+        *suse*)            PKGFAM=suse ;;
+        *alpine*)          PKGFAM=alpine ;;
+    esac
+fi
+
+pkg_install() {
+    # One or more package names; the manager prefix is chosen by PKGFAM. Takes
+    # the package list as a single remaining-arguments call so callers can pass
+    # one name or several without a second positional parameter to forget --
+    # which under `set -u` aborted the whole script.
+    local pkgs="$*"
+    case "${PKGFAM}" in
+        debian) echo "sudo apt install ${pkgs}" ;;
+        fedora) echo "sudo dnf install ${pkgs}" ;;
+        arch)   echo "sudo pacman -S --needed ${pkgs}" ;;
+        suse)   echo "sudo zypper install ${pkgs}" ;;
+        alpine) echo "sudo apk add ${pkgs}" ;;
+        *)      echo "# install ${pkgs} with your package manager" ;;
+    esac
+}
+
+DESKTOP="${XDG_CURRENT_DESKTOP:-${DESKTOP_SESSION:-unknown}}"
+case "${DESKTOP}" in
+    *GNOME*|*gnome*)
+        # The one case that is a plain package install. It does need a
+        # relogin, because the shell loads extensions at login.
+        PKG="gnome-shell-extension-appindicator"
+        case "${PKGFAM}" in
+            debian) PKG="gnome-shell-extension-ubuntu-appindicators" ;;
+            arch)   PKG="gnome-shell-extension-appindicator" ;;
+        esac
+        cat <<EOF
+  GNOME removed its system tray, so an extension has to put one back.
+
+    $(pkg_install "$PKG")
+
+  Then LOG OUT AND BACK IN -- GNOME only reads extensions at login. After that,
+  the tray icon will appear.
+
+  Note: if a distro upgrade disables the extension, the icon will vanish again
+  and the same package fixes it.
+EOF
+        exit 0
+        ;;
+
+    *Hyprland*|*hyprland*)
+        cat <<'EOF'
+  Hyprland has no system tray of its own. Two good options:
+
+  OPTION A -- Stalonray, a standalone tray host. Simplest, no bar edits:
+
+EOF
+        echo "      $(pkg_install stalonray)"
+        cat <<'EOF'
+      then add to ~/.config/hypr/hyprland.conf:
+          exec-once = stalonray
+
+  OPTION B -- use the tray module in the Waybar you already run.
+      Edit the waybar config and add a "tray" module, e.g.:
+          modules-right += tray
+
+  Either works. Once a tray host is running, log out and back in and start
+  lanlog-tray.
+EOF
+        exit 0
+        ;;
+
+    *Sway*|*sway*|*i3*|*river*|*niri*|*dwm*|*bspwm*|*awesome*)
+        cat <<EOF
+  ${DESKTOP} has no system tray of its own. A standalone tray host is the usual
+  answer:
+
+      $(pkg_install stalonray)
+
+  then start it from your session config, e.g. for Sway:
+      exec stalonray
+
+  Or use a panel with a tray applet, if you already run one.
+EOF
+        exit 0
+        ;;
+
+    *XFCE*|*xfce*|*Cinnamon*|*cinnamon*|*MATE*|*mate*|*LXQt*|*lxqt*)
+        cat <<EOF
+  ${DESKTOP} normally has a tray, so something is not running. Check the
+  panel's startup applications for a tray applet and re-enable it.
+
+  If the panel is present but has no tray module, the package that provides it
+  is usually:
+
+      $(pkg_install stalonray)
+
+  which is a standalone host you can start from the panel's autostart settings.
+EOF
+        exit 0
+        ;;
+
+    *KDE*|*kde*|*Plasma*|*plasma*)
+        cat <<EOF
+  KDE Plasma normally provides a tray, so this is unusual. The host is
+  kswaygrd / plasmashell. Check it is running:
+
+      pgrep -a plasmashell
+      pgrep -a kswaygrd
+
+  If you are on a Wayland session and the panel is missing, restarting it is
+  usually enough:
+
+      systemctl --user restart plasma-plasmashell
+EOF
+        exit 0
+        ;;
+esac
+
+cat <<EOF
+  Could not identify the desktop from the environment (saw: ${DESKTOP}).
+
+  A system tray is provided by whichever program owns the "StatusNotifierWatcher"
+  name on your session bus. To find out what already provides one:
+
+      gdbus call --session --dest org.kde.StatusNotifierWatcher \\
+          --object-path /StatusNotifierWatcher \\
+          --method org.freedesktop.DBus.Properties.Get \\
+          org.kde.StatusNotifierWatcher IsStatusNotifierHostRegistered
+
+  A result of "(<true>,)" means a tray is available. "(<false>,)" means nothing
+  is, and lanlog-tray needs one of the tray hosts described in the README.
+
+  Common choices: stalonray (standalone, works anywhere), or the tray module of
+  a bar you already run (Waybar, Yambar, tint2, Polybar).
+EOF
+exit 0

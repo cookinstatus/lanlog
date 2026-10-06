@@ -1,0 +1,1009 @@
+#!/usr/bin/env python3
+"""lanlog - see what devices on your LAN are talking to, right now.
+
+  lanlog              live dashboard (records + shows, refreshes every 1s)
+  lanlog record       just record in the background, no dashboard
+  lanlog devices      device inventory
+  lanlog domains      most-queried domains
+  lanlog client IP    what one device looked up
+  lanlog shared       domains hit by more than one device
+  lanlog third-party  cross-device trackers
+  lanlog reset        wipe the database
+
+  lanlog setup              detect this network, write the config
+  lanlog start / stop       control the background service
+  lanlog status             is the logger running?
+  lanlog config [key val]   show/change display settings
+  lanlog toggle             cycle device labels: names -> ip -> both
+  lanlog name set|list|remove nicknames for devices
+  lanlog mac MAC-or-IP        look up a MAC address or OUI prefix
+  lanlog purge-reverse        delete stored PTR/reverse-lookup rows
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import time
+
+# bin/ is this file's directory; the project root is one level up. realpath
+# follows the ~/.local/bin launcher's symlink back to the real location, so the
+# same code runs from the project checkout and from the installed launcher.
+_BIN = os.path.dirname(os.path.realpath(__file__))
+_ROOT = os.path.dirname(_BIN)
+for _p in (_ROOT, _BIN):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from lanlog import db  # noqa: E402
+from lanlog import report  # noqa: E402
+
+DIM = "\033[2m"
+BOLD = "\033[1m"
+CYAN = "\033[36m"
+YEL = "\033[33m"
+RED = "\033[1;31m"
+GRN = "\033[32m"
+RST = "\033[0m"
+
+
+def _c(txt, code):
+    return f"{code}{txt}{RST}" if sys.stdout.isatty() else txt
+
+
+def _block_verdicts(qnames):
+    """{qname: (verdict, matched_listed_domain)} for the rows on screen.
+
+    Returns an empty dict when Pi-hole's gravity is unreadable, and the render
+    then omits the mark column entirely -- see _block_mark.
+    """
+    try:
+        from lanlog import blocking
+
+        table = blocking.domains()
+        if not table:
+            return {}
+        return {q: blocking.status(q, table) for q in qnames if q}
+    except Exception:  # noqa: BLE001 - a bad blocklist must not kill the dashboard
+        return {}
+
+
+def _block_mark(verdict):
+    """The per-query blocking mark, or "" when there is nothing to say.
+
+    Three states, and the third is why this returns "" rather than a default:
+
+      blocked -> BLOCKED, in red
+      allowed -> a dim dot, so the column lines up and an all-clear still reads
+                 as deliberate rather than as missing data
+      unknown -> "" for every row, because Pi-hole is not readable and claiming
+                 "allowed" would assert that nothing is blocked, which is the
+                 one thing this feature exists to tell you honestly
+    """
+    if not verdict:
+        return ""
+    state, _match = verdict
+    if state == "blocked":
+        return _c("BLOCKED ", RED)
+    if state == "allowed":
+        return _c("·       ", DIM)
+    return ""
+
+
+class _NameResolver:
+    """Resolves device names off the main loop.
+
+    Name resolution costs 12ms-3s per device (mDNS and router PTR both spawn
+    subprocesses). Doing it inline made the dashboard block: a single
+    non-advertising device stalled a repaint for the full mDNS timeout. This
+    keeps a cache of what is already known, hands unknown IPs to a background
+    worker, and returns the cached value immediately -- the name simply appears
+    a frame or two later.
+    """
+
+    def __init__(self):
+        import queue
+        import threading
+
+        from lanlog import identify
+
+        self._identify = identify
+        self._known = {}
+        self._queue = queue.Queue()
+        self._lock = threading.Lock()
+        self._queued = set()      # IPs already handed to the worker
+        self._stop = threading.Event()
+        self._worker = threading.Thread(target=self._run, daemon=True)
+        self._worker.start()
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                ip = self._queue.get(timeout=0.5)
+            except Exception:  # queue.Empty, or shutdown
+                continue
+            if ip is None:
+                break
+            try:
+                name, _src = self._identify.describe(ip)
+            except Exception:  # never let a lookup kill the thread
+                name = ip
+            with self._lock:
+                self._known[ip] = name or ip
+
+    def get(self, ip):
+        """Best known name for ip; schedules a lookup if we have none yet."""
+        with self._lock:
+            name = self._known.get(ip)
+        if name:
+            return name
+        # Fast path: the persistent cache may already have it (avoids queueing).
+        try:
+            cached = self._identify._cache_get(ip)
+        except Exception:
+            cached = None
+        if cached:
+            with self._lock:
+                self._known[ip] = cached[0]
+            return cached[0]
+        with self._lock:
+            if ip in self._queued:
+                return ip
+            self._queued.add(ip)
+        self._queue.put(ip)
+        return ip
+
+    def prefetch(self, ips):
+        for ip in ips:
+            self.get(ip)
+
+    def stop(self):
+        self._stop.set()
+        self._queue.put(None)
+
+
+def dashboard(conn, window=900):
+    """Live view: recent query rate, busiest clients, freshest domains."""
+    import collections
+
+    from lanlog import banner as banner_mod
+    from lanlog import identify, keys as keys_mod
+
+    last_cmd, last_out = "", ""
+    resolver = _NameResolver()
+
+    # View settings. Re-read each frame so `lanlog config query_lines 20`
+    # takes effect immediately without restarting the dashboard.
+    from lanlog import devices as devcfg
+
+    query_lines, refresh = 8, 1
+    labels = "names"
+
+    with keys_mod.Keys() as keys:
+        while True:
+            now = time.time()
+
+            # Re-read view settings every frame: a running dashboard picks up
+            # `lanlog config query_lines 20` on the next repaint.
+            cfg = devcfg.load_config()
+            query_lines = devcfg.get_int(cfg, "query_lines")
+            refresh = devcfg.get_int(cfg, "refresh")
+            labels = devcfg.label_mode(cfg)
+            # show_kinds is applied to the resolver itself, not at render time:
+            # the dashboard labels come from identify.describe(), so setting the
+            # flag here is what makes the setting actually affect this screen.
+            identify._set_kinds(
+                cfg.get("show_kinds", "yes").lower() not in ("no", "false", "0")
+            )
+
+            total = conn.execute("SELECT COUNT(*) FROM queries").fetchone()[0]
+            recent = conn.execute(
+                "SELECT COUNT(*) FROM queries WHERE ts >= ?", (now - window,)
+            ).fetchone()[0]
+            ndev = conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
+
+            # Clients, as (label, count) pairs.
+            clients = collections.Counter()
+            for ip, c in conn.execute(
+                "SELECT client, COUNT(*) c FROM queries WHERE ts >= ? GROUP BY client"
+                " ORDER BY c DESC LIMIT 8", (now - window,)
+            ):
+                clients[ip] = c
+            # Prefetch, but do NOT keep the result. `_NameResolver.get` returns
+            # the bare IP as a placeholder while a lookup is still queued in the
+            # background worker, and an earlier version stored that placeholder
+            # in a local dict guarded by `if ip not in names`. The key then
+            # existed, so it was never refreshed, and the dashboard showed IPs
+            # for the whole session even after the worker had resolved the real
+            # name -- which is precisely the reported symptom: names "gone",
+            # permanently, on a machine whose resolver works fine. Rendering
+            # now asks the resolver directly, so a placeholder is displayed for
+            # a frame or two and then replaced by the real name.
+            for ip in clients:
+                resolver.get(ip)
+
+            fresh = list(conn.execute(
+                "SELECT client, qtype, qname FROM queries ORDER BY ts DESC LIMIT ?",
+                (query_lines,),
+            ))
+            # Blocking verdict per visible query, computed once per frame and
+            # only for the handful of rows actually on screen. The alternative --
+            # a per-row lookup inside the render loop -- repeated the same set
+            # walk for every row on every repaint of a dashboard that repaints
+            # every second.
+            verdicts = _block_verdicts([r[2] for r in fresh])
+
+            # Choose banner size so the whole view fits the terminal. On a
+            # standard 80x24 the full 14-row banner does not fit and the
+            # display scrolls on every repaint.
+            rows = _term_rows()
+            # Count the body exactly instead of estimating. The sections below
+            # are built conditionally, so the honest total is the sum of the
+            # pieces that will actually be emitted. A stale constant here is
+            # what forced the compact logo when there was plenty of room.
+            busy_rows = (1 + len(clients) + 1) if clients else 0
+            query_rows = (1 + len(fresh) + 1) if fresh else 0
+            cmd_rows = (1 + min(6, len(last_out.splitlines())) + 1) if last_cmd else 0
+            # CONFIG_MENU / DOMAIN_MENU are module-level in keys.py, not Keys
+            # attributes, and the two menus have different row counts.
+            if keys.menu == "config":
+                menu_rows = len(keys_mod.CONFIG_MENU) + 3
+            elif keys.menu == "domains":
+                menu_rows = len(keys_mod.DOMAIN_MENU) + 3
+            else:
+                menu_rows = 0
+            body_rows = 1 + 3 + 1 + busy_rows + query_rows + cmd_rows + 1 + menu_rows
+
+            big = banner_mod.banner_lines()
+            compact = banner_mod.compact()
+            big_cost = len(big) + 1        # logo + blank separator
+            small_cost = 2                 # one-line logo + blank
+
+            # Shed the least important sections until the full logo fits.
+            # Priority, least important first: the query list, then extra
+            # client rows, then the logo itself. A command the user just ran
+            # outranks all of them -- it is why they pressed the key.
+            if big_cost + body_rows > rows:
+                if fresh and big_cost + body_rows - (len(fresh) - 1) <= rows:
+                    # Trim the query panel to a single row. Compute the saving
+                    # from the OLD length before reassigning, or the saving
+                    # comes out as zero.
+                    saved = len(fresh) - 1
+                    fresh = fresh[:1]
+                    query_rows = 2
+                    body_rows -= saved
+                elif clients and big_cost + body_rows - (len(clients) - 3) <= rows:
+                    saved = len(clients) - 3
+                    clients = collections.Counter(dict(clients.most_common(3)))
+                    busy_rows = 4
+                    body_rows -= saved
+            use_big = big_cost + body_rows <= rows
+
+            # Still too tall, or a command is waiting to be shown: the command
+            # output is why the user pressed a key, so it outranks the query
+            # list, the who's-busy panel, AND the logo. Shed in that order --
+            # the logo is decoration, the command is the request.
+            #
+            # Drop the logo LAST. An earlier version dropped it first, which
+            # cost 4 rows that the panels then wasted instead.
+            if last_cmd and not menu_rows:
+                for _ in range(3):
+                    need = (big_cost if use_big else small_cost) + body_rows
+                    need += cmd_rows - rows
+                    if need <= 0:
+                        break
+                    # Drop whole sections while the screen is over budget. A
+                    # section is worth dropping whenever present: the freed
+                    # rows reduce `need` and the loop re-tests. An earlier
+                    # version required `section >= need`, so a gap larger than
+                    # any single section shed nothing at all and the listing
+                    # was still truncated.
+                    if query_rows:
+                        body_rows -= query_rows
+                        query_rows = 0
+                        fresh = []
+                    elif busy_rows:
+                        body_rows -= busy_rows
+                        busy_rows = 0
+                        clients = collections.Counter()
+                    elif use_big and small_cost < big_cost:
+                        use_big = False
+                    else:
+                        break
+                # cmd_rows is NOT in body_rows, so it has to be added here or
+                # the logo is judged against a height it will never occupy.
+                use_big = use_big and (big_cost + body_rows + cmd_rows <= rows)
+
+            out = []
+            # One helper for every device label on the dashboard, so the two
+            # panels and the WHO'S BUSY list cannot disagree about what mode is
+            # active. The mode is applied at render time, not at resolve time:
+            # the resolver caches names per IP, so flipping the mode costs
+            # nothing and needs no re-resolution.
+            #
+            # The resolver's cache maps ip -> name string, while report._label
+            # expects the ip -> (name, source) shape describe_all() returns, so
+            # it is wrapped here rather than changing either contract. _fit
+            # keeps a trailing "(ip)" intact when the label is too wide.
+            def _dev(ip, width):
+                # The resolver, not a local dict of the top-8 busiest clients:
+                # such a dict has no entry for a device that is merely not in
+                # the top 8, so that device's queries fell back to the raw IP
+                # even when its name was already resolved -- the same "names are
+                # gone" symptom on one panel while the other looked fine.
+                entry = resolver.get(ip)
+                shaped = {ip: (entry, "?")} if entry else None
+                return report._fit(report._label({"ip": ip}, shaped, labels), width)
+            if use_big:
+                out.extend(big)
+            else:
+                out.append(_c(compact, BOLD + CYAN))
+            out.append("")
+            out.append(f" {_c('LAN ACTIVITY', BOLD + CYAN)}")
+            out.append(f" {total} queries total   {recent} in last {window // 60}m"
+                       f"   {ndev} devices known")
+            out.append("")
+
+            if clients:
+                top = max(clients.values()) or 1
+                out.append(_c(" WHO'S BUSY", BOLD))
+                for ip, c in clients.items():
+                    bar = "#" * max(1, round(14 * c / top))
+                    # 32 for names, 40 for ip/both: an address alone is 15
+                    # characters, and "both" adds the name in front of it, so the
+                    # old 32 clipped the address off the end of every row in the
+                    # one mode that is specifically for seeing the address.
+                    w = 32 if labels == "names" else 40
+                    out.append(f" {_dev(ip, w):<{w}} {c:>5}  {_c(bar, CYAN)}")
+                out.append("")
+
+            if fresh:
+                out.append(_c(" LATEST QUERIES", BOLD))
+                for client, qtype, qname in fresh:
+                    dw = 24 if labels == "names" else 38
+                    out.append(f" {_dev(client, dw):<{dw}} {qtype:<6} "
+                               f"{_block_mark(verdicts.get(qname))}"
+                               f"{qname[:40]}")
+                out.append("")
+
+            if last_cmd:
+                # Command output is what the user just asked for, so it gets
+                # the space it needs. It used to be hard-capped at 6 lines,
+                # which meant "devices" silently showed 4 of 12 devices -- the
+                # exact opposite of what was asked for.
+                out_lines = last_out.splitlines()
+                # Rows left after the logo and the fixed sections. busy_rows
+                # and menu_rows are read AFTER the shedding above, so this
+                # reflects panels that were actually dropped.
+                fixed = big_cost if use_big else small_cost
+                fixed += 1 + 3 + 1 + 1          # sep, activity hdr, 2 lines, sep
+                fixed += menu_rows if menu_rows else busy_rows
+                budget = max(4, rows - fixed - 1)
+                out.append(_c(f" $ lanlog {last_cmd}", BOLD + YEL))
+                # The last line is the summary/count, which matters more than
+                # any single row, and the first line is the column header.
+                # Keeping both means a truncated list still says what it is and
+                # how many there are.
+                if len(out_lines) > budget:
+                    keep_head = out_lines[:1]
+                    keep_tail = out_lines[-1:]
+                    room = budget - len(keep_head) - len(keep_tail)
+                    shown = keep_head + out_lines[1:1 + max(0, room)] + keep_tail
+                else:
+                    shown = out_lines
+                out.extend(shown)
+                hidden = len(out_lines) - len(shown)
+                if hidden > 0:
+                    out.append(_c(f"   ... {hidden} more line(s) not shown", DIM))
+                out.append("")
+
+            uniq = conn.execute(
+                "SELECT COUNT(DISTINCT qname) FROM queries WHERE ts >= ?",
+                (now - window,)
+            ).fetchone()[0]
+            out.append(_c(f" {uniq} unique domains in window", DIM))
+
+            if keys.menu:
+                # Menus. Rendered last and protected from the height truncation
+                # below: whichever one the user opened is the thing they are
+                # looking at, so it must never be the part that gets cut.
+                out.append("")
+                if keys.menu == "config":
+                    menu_block = [_c(line, BOLD + CYAN)
+                                  for line in keys.menu_lines(cfg)]
+                else:
+                    menu_block = [_c(line, BOLD + CYAN)
+                                  for line in keys.domain_menu_lines()]
+                out.extend(menu_block)
+                out.append("")
+                # Drop query rows, never menu rows, to make the height budget.
+                limit = rows - 1
+                while len(out) > limit and len(out) > len(menu_block) + 3:
+                    out.pop(1)   # index 1 keeps the banner, drops body rows
+                # The second pass drops from the end and MUST keep a floor. A
+                # bare `while len(out) > limit: out.pop()` walks the list down to
+                # empty and then raises IndexError, because nothing stops it
+                # once the menu alone is taller than the terminal. That is
+                # reachable with a short window, and it kills the dashboard
+                # outright rather than drawing a clipped one. The floor keeps
+                # the banner plus the menu, which is the minimum worth showing.
+                floor = len(menu_block) + 1
+                limit = max(limit, floor)
+                while len(out) > limit:
+                    out.pop()
+            else:
+                # Paint with explicit cursor home + clear-down, and truncate to
+                # the terminal height so nothing scrolls off. Same floor as
+                # above: never pop the list empty.
+                limit = max(rows - 1, 1)
+                while len(out) > limit:
+                    out.pop()
+
+            print("\033[H\033[J", end="")
+            print("\n".join(out))
+
+            bar, active = keys.bar()
+            print(_c(bar, DIM) if not active else _c(bar, YEL + BOLD))
+            sys.stdout.flush()
+
+            # Wait for a keystroke, but repaint every `refresh` seconds.
+            deadline = time.time() + refresh
+            while time.time() < deadline:
+                keys.poll(timeout=0.2)
+                if getattr(keys, "pending", None):
+                    cmd = keys.pending
+                    keys.pending = None
+                    last_cmd = cmd
+                    last_out = _run_quick(conn, cmd)
+                    break
+                if keys.last_digit:
+                    keys.expand(keys.last_digit)
+                    keys.last_digit = None
+
+
+def _term_rows():
+    """Terminal height, defaulting to 24 when it cannot be determined."""
+    try:
+        return os.get_terminal_size().lines
+    except OSError:
+        return 24
+
+
+def _run_quick(conn, cmd):
+    """Execute a command typed into the dashboard bar. Returns text output.
+
+    Only the read-only report commands are wired up. Anything that mutates
+    state (reset, purge-reverse) is deliberately excluded -- a mistyped command
+    inside a live dashboard should not be able to wipe the database.
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    # report.py is now lanlog.report -- a normal package import, so the
+    # sys.path juggling the old beside-the-package copy needed is gone.
+    from lanlog import devices as devcfg
+
+    parts = cmd.split()
+    if not parts:
+        return ""
+    name, args = parts[0], parts[1:]
+
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            if name == "devices":
+                report.show_devices(conn)
+            elif name == "domains":
+                report.show_top_domains(conn, 10)
+            elif name == "blocked":
+                report.show_blocked_domains(conn, 10)
+            elif name == "shared":
+                report.show_shared(conn, 10)
+            elif name == "third-party":
+                report.show_third_party(conn)
+            elif name == "client" and args:
+                report.show_client(conn, args[0], 10)
+            elif name == "toggle":
+                # Cycle the device column. Routed through the same helper the
+                # CLI uses so both surfaces persist the same setting, and the
+                # next repaint picks it up without a restart.
+                mode = devcfg.toggle_label_mode()
+                print(f"  labels = {mode}   (next: "
+                      f"{' -> '.join(devcfg.LABEL_MODES)})")
+            elif name == "config":
+                if args:
+                    # Setting a value from the dashboard, e.g.
+                    #   config query_lines 20
+                    cfg = devcfg.set_config(args[0], args[1] if len(args) > 1 else "yes")
+                    print(f"  {args[0]} = {cfg[args[0]]}  (takes effect next refresh)")
+                else:
+                    cfg = devcfg.load_config()
+                    for k, v in cfg.items():
+                        print(f"  {k:<12} {v}")
+            elif name == "name" and args[:1] == ["list"]:
+                nick = devcfg.list_nicknames()
+                for ip, n in sorted(nick.items()) or []:
+                    print(f"  {ip:<16} {n}")
+                if not nick:
+                    print("  no nicknames set")
+            elif name == "help":
+                print("  " + keys_mod_hint())
+            else:
+                print(f"  '{cmd}' not available in the dashboard bar.")
+                print("  press [7] for settings, or Esc to quit")
+        return buf.getvalue().rstrip()
+    except Exception as exc:  # noqa: BLE001 - never kill the dashboard
+        return f"  error: {exc}"
+
+
+def keys_mod_hint():
+    from lanlog import keys as k
+    return k.BAR_HINT
+
+
+def cmd_record(args):
+    os.execv(sys.executable, [sys.executable,
+             os.path.join(_ROOT, "lan-logger.py"),
+             "--cidr", args.cidr, "--sweep-interval", str(args.sweep_interval)])
+
+
+def cmd_reset(args):
+    import glob
+    base = os.path.splitext(db.DB_PATH)[0]
+    for p in glob.glob(base + "*"):
+        os.remove(p)
+        print("removed", p)
+
+
+def cmd_orbic(args):
+    """Inspect the hotspot's DNS log over SSH."""
+    from lanlog import db, orbic
+
+    host = args.host
+    action = args.action
+    if action == "probe":
+        print(f"SSHing to {host} ...", flush=True)
+        rc, out = orbic.ssh(host, "uname -a")
+        if rc != 0:
+            print(f"  ssh failed (rc={rc}): {out.strip()}")
+            print("  Is the hotspot in range and is key-based root login "
+                  "working?")
+            return
+        print(f"  connected: {out.strip().splitlines()[0] if out.strip() else '?'}")
+        # find_log() returns a path string or None -- it does NOT return a
+        # (path, rc) pair. Unpacking it raised "too many values to unpack" on
+        # every successful probe, i.e. whenever the hotspot was actually in
+        # range. Verified against the function's own contract.
+        log = orbic.find_log(host)
+        if not log:
+            print("  no known log path found; try --log /path/to/file")
+            return
+        print(f"  log: {log}")
+        # probe() returns (path, lines). Assigning the pair to `lines` then
+        # iterating it walked the tuple, not the log -- and the loop below
+        # printed nothing because neither element is a log line.
+        _path, lines = orbic.probe(host, log, lines=args.lines)
+        if not lines:
+            print("  (log is empty -- is the DNS sniffer enabled in DagShell?)")
+            return
+        print("  raw lines -- add a regex to lanlog/orbic.py if these "
+              "don't parse:")
+        for line in lines:
+            rec = orbic.parse_line(line)
+            tag = "OK  " if rec else "MISS"
+            print(f"  {tag} {line.rstrip()}")
+            if rec:
+                # parse_line returns a 5-tuple (ts, client, qname, qtype,
+                # outcome), not a dict. Indexing it by name raised TypeError.
+                ts, client, qname, qtype, _outcome = rec
+                print(f"         -> {client} {qname}  ({qtype})")
+
+    elif action == "sources":
+        rc, out = orbic.ssh(host, "ls -1 /var/log/*.log 2>/dev/null")
+        print("  log files on the hotspot:" if out.strip()
+              else "  (no /var/log/*.log, or ssh failed)")
+        for line in out.splitlines():
+            print(f"    {line.strip()}")
+
+    elif action == "status":
+        conn = db.connect()
+        rows = conn.execute(
+            "SELECT client, qname, ts FROM queries WHERE source='orbic' "
+            "ORDER BY ts DESC LIMIT 15"
+        ).fetchall()
+        if not rows:
+            print("no orbic data yet -- start the service with ORBIC_HOST set")
+            return
+        now = time.time()
+        print(f"{'client':<16} {'domain':<40}  age")
+        print("-" * 66)
+        for r in rows:
+            print(f"{r['client']:<16} {r['qname'][:39]:<40} {int(now - r['ts'])}s")
+
+
+SERVICE = "lan-logger.service"
+SERVICE_TEMPLATE = """[Unit]
+Description=lanlog: LAN DNS query and device logger
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={python} -u {script}
+Restart=always
+RestartSec=5
+# Do not restart in a tight loop if the container is missing.
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def service_unit_dir():
+    """Where user units live. Honours XDG so a custom config dir still works."""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "systemd", "user")
+
+
+def install_service():
+    """Write the user unit, then enable it. Returns the unit path."""
+    script = os.path.join(_ROOT, "lan-logger.py")
+    unit_dir = service_unit_dir()
+    os.makedirs(unit_dir, exist_ok=True)
+    path = os.path.join(unit_dir, SERVICE)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(SERVICE_TEMPLATE.format(python=sys.executable, script=script))
+    # Linger keeps the unit running after logout, which is what makes this
+    # useful as a background logger rather than something you start by hand.
+    subprocess.run(["systemctl", "--user", "enable", SERVICE],
+                   capture_output=True, text=True)
+    subprocess.run(["loginctl", "enable-linger", os.environ.get("USER", "")],
+                   capture_output=True, text=True)
+    return path
+
+
+def service_action(action, args=None):
+    """start / stop / status for the logger's user service.
+
+    `start` rewrites the unit when it is missing OR when it still points at a
+    different checkout. The unit is a file full of absolute paths, so moving the
+    project (a plain rename) leaves systemd starting a script that no longer
+    exists -- which is exactly what happened when the package was merged. A
+    stale path is silently fatal, so it is repaired here rather than left for
+    the user to notice.
+    """
+    unit_path = os.path.join(service_unit_dir(), SERVICE)
+    script = os.path.join(_ROOT, "lan-logger.py")
+    needs_write = not os.path.exists(unit_path)
+    if not needs_write:
+        try:
+            with open(unit_path, encoding="utf-8") as fh:
+                needs_write = script not in fh.read()
+        except OSError:
+            needs_write = True
+    if action == "start" and needs_write:
+        path = install_service()
+        print(f"installed {path}")
+    if action == "status":
+        r = subprocess.run(["systemctl", "--user", "status", SERVICE],
+                           capture_output=True, text=True)
+        print(r.stdout or r.stderr)
+        return 0 if r.returncode == 0 else 1
+    r = subprocess.run(["systemctl", "--user", action, SERVICE],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(r.stderr.strip() or f"systemctl {action} failed", file=sys.stderr)
+        print("Recent log lines:", file=sys.stderr)
+        j = subprocess.run(["journalctl", "--user", "-u", SERVICE, "-n", "15",
+                            "--no-pager"], capture_output=True, text=True)
+        print(j.stdout, file=sys.stderr)
+        return r.returncode
+    print(f"logger {action}ed")
+    return 0
+
+
+def cmd_setup(args):
+    """Detect this network and write ~/.config/lanlog/config.
+
+    Run once after install. Re-run it if you move Pi-hole to a different
+    address or change networks. Nothing here is mandatory -- detection happens
+    automatically at run time too -- but writing the file makes the settings
+    visible and editable instead of implicit.
+    """
+    from lanlog import config as lcfg
+
+    s = lcfg.settings()
+    print("detected:")
+    for key in lcfg.DEFAULTS:
+        print(f"  {key:<12} {s[key] or '(not found)'}")
+
+    problems = []
+    if not s["runtime"]:
+        problems.append("no podman/docker on PATH -- install one, or lanlog "
+                        "cannot read Pi-hole's log")
+    if not s["container"]:
+        problems.append("no Pi-hole container found -- is it running? "
+                        "(podman ps)")
+    if not s["cidr"]:
+        problems.append("could not determine this host's subnet -- device "
+                        "discovery will be off; set cidr= manually")
+    if not s["router"]:
+        problems.append("could not determine the default gateway -- device "
+                        "names from DHCP will not resolve; set router= manually")
+
+    ip = s["pihole_ip"]
+    if ip and s["runtime"] and s["container"]:
+        ok = lcfg.verify_dns(ip)
+        print(f"\nDNS check at {ip}: {'answering' if ok else 'NO ANSWER'}")
+        if not ok:
+            problems.append(
+                f"nothing is answering DNS at {ip}. If Pi-hole is published on "
+                f"a different address, set pihole_ip= in the config file.")
+
+    if args.write or not problems:
+        path = lcfg.save_settings(s)
+        print(f"\nwrote {path}")
+
+    if problems:
+        print("\nneeds attention:", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        print("\nFix these, then re-run:  lanlog setup", file=sys.stderr)
+        return 1
+    print("\nSetup looks good. Start the logger with:  lanlog start")
+    return 0
+
+
+def cmd_config(args):
+    """View or change display settings and nicknames."""
+    from lanlog import devices as dev
+
+    if args.key:
+        try:
+            cfg = dev.set_config(args.key, args.value)
+        except ValueError as exc:
+            # A bad value must be reported clearly rather than a bare
+            # traceback -- the numeric settings have bounds.
+            print(f"error: {exc}", file=sys.stderr)
+            lo, hi = dev.INT_BOUNDS.get(args.key, (None, None))
+            if lo is not None:
+                print(f"  valid range: {lo}-{hi}", file=sys.stderr)
+            sys.exit(2)
+        print(f"{args.key} = {cfg[args.key]}")
+        if args.key in dev.INT_BOUNDS:
+            print("  applies to a running dashboard on its next refresh")
+        return
+
+    cfg = dev.load_config()
+    print("display settings  (~/.config/lanlog/config)")
+    print("-" * 52)
+    for key, val in cfg.items():
+        hint = ""
+        if key == "show_kinds":
+            hint = "  show the '(Vendor)' hint after a device name"
+        elif key == "hide_idle":
+            hint = "  hide devices that have never made a DNS query"
+        elif key == "only":
+            hint = "  comma-separated IPs to show, e.g. 192.168.1.88,192.168.1.163"
+        elif key == "labels":
+            hint = "  device column shows names / ip / both"
+        elif key == "query_lines":
+            lo, hi = dev.INT_BOUNDS["query_lines"]
+            hint = f"  rows of recent queries on the live dashboard ({lo}-{hi})"
+        elif key == "refresh":
+            lo, hi = dev.INT_BOUNDS["refresh"]
+            hint = f"  live dashboard repaint interval in seconds ({lo}-{hi})"
+        print(f"  {key:<12} {val:<12}{hint}")
+    print(f"\nchange with: lanlog config <key> <value>   e.g. lanlog config query_lines 20")
+    print("cycle the device column with:  lanlog toggle")
+
+
+def cmd_toggle(args):
+    """Cycle the device column between names, ip, and both.
+
+    Its own command rather than only a config key, because the failure it helps
+    diagnose is silent: when the resolver stops naming devices the name view
+    degrades to a screen of bare IPs that looks exactly like a working one.
+    Flipping to `ip` makes the difference visible at a glance, and `both` shows
+    which rows actually resolved.
+    """
+    from lanlog import devices as dev
+
+    mode = dev.toggle_label_mode()
+    print(f"labels = {mode}")
+    print(f"  cycles {' -> '.join(dev.LABEL_MODES)}; a running dashboard "
+          f"picks this up on its next refresh")
+
+
+DEFAULT_KEYS = ["show_kinds", "hide_idle", "only", "labels", "query_lines",
+                "refresh"]
+
+
+def cmd_name(args):
+    """Give a device a nickname, or list/remove existing ones."""
+    from lanlog import devices as dev
+
+    if args.action == "list":
+        nick = dev.list_nicknames()
+        if not nick:
+            print("no nicknames set. Add one with:")
+            print("  lanlog name set 192.168.1.88 \"living room fire stick\"")
+            return
+        print("nicknames:")
+        for ip, name in sorted(nick.items()):
+            print(f"  {ip:<16} {name}")
+        return
+
+    if args.action == "remove":
+        if dev.remove_nickname(args.ip):
+            print(f"removed nickname for {args.ip}")
+        else:
+            print(f"no nickname set for {args.ip}")
+        return
+
+    # set
+    name = args.name
+    if not name:
+        print("usage: lanlog name set <ip> \"<nickname>\"", file=sys.stderr)
+        sys.exit(2)
+    entry = dev.set_nickname(args.ip, name)
+    print(f"saved: {entry}")
+    print(f"       (edit {os.path.expanduser('~/.config/lanlog/aliases')})")
+
+
+def cmd_mac(args):
+    """Look up what a MAC address or OUI prefix belongs to."""
+    from lanlog import devices as dev
+
+    target = args.mac
+    # Accept an IP as a convenience and find its MAC from the neighbour table.
+    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", target):
+        mac = dev.mac_for_ip(target)
+        if not mac:
+            print(f"no MAC known for {target} (not in the neighbour table).")
+            print("It may be offline, or never seen. Try the MAC directly.")
+            sys.exit(1)
+        print(f"{target} -> {mac}")
+        target = mac
+
+    result = dev.lookup_mac(target, use_online=args.online)
+    if "error" in result:
+        print(result["error"], file=sys.stderr)
+        sys.exit(2)
+
+    print()
+    print(f"  OUI       {result['prefix']}" + (f"   full MAC  {result['mac']}"
+                                             if result["mac"] else ""))
+    print(f"  vendor    {result['local']}")
+    if result["online"]:
+        print(f"  online    {result['online']}")
+    elif result["source"] == "local" and not args.online:
+        # Offline is the default: the OUI prefix identifies hardware and there
+        # is no reason to hand it to a third party unless asked. Same reasoning
+        # as `devices.py` documents -- the previous default was the opposite of
+        # what that comment claimed.
+        print("  online    (offline -- add --online to query macvendors.com)")
+
+
+def purge_reverse(conn):
+    """Delete reverse-lookup rows recorded before this filtering existed."""
+    cur = conn.execute(
+        "DELETE FROM queries WHERE qtype='PTR'"
+        " OR qname LIKE '%in-addr.arpa' OR qname LIKE '%ip6.arpa'"
+    )
+    return cur.rowcount
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="lanlog", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+
+    d = sub.add_parser("devices"); d.add_argument("--hours", type=float)
+    sub.add_parser("domains").add_argument("--limit", type=int, default=25)
+    b = sub.add_parser("blocked",
+                       help="only the domains Pi-hole blocked")
+    b.add_argument("--limit", type=int, default=25)
+    b.add_argument("--hours", type=float)
+    sub.add_parser("shared").add_argument("--limit", type=int, default=30)
+    sub.add_parser("third-party").add_argument("--hours", type=float, default=24.0)
+    c = sub.add_parser("client"); c.add_argument("ip"); c.add_argument("--limit", type=int, default=40)
+    sub.add_parser("reset")
+    sub.add_parser("purge-reverse", help="delete stored PTR/reverse-lookup rows")
+
+    o = sub.add_parser("orbic", help="Orbic hotspot DNS logs (over SSH)")
+    o.add_argument("action", choices=["probe", "status", "sources"])
+    o.add_argument("--host", default=os.environ.get("ORBIC_HOST", "192.168.1.1"))
+    o.add_argument("--log", default=None)
+    o.add_argument("--lines", type=int, default=15)
+
+    s = sub.add_parser("setup", help="detect this network and write the config")
+    s.add_argument("--write", action="store_true",
+                   help="write the config even if detection found problems")
+    for name, blurb in (("start", "start the background logger"),
+                        ("stop", "stop the background logger"),
+                        ("status", "show the logger's service status")):
+        sub.add_parser(name, help=blurb)
+
+    c = sub.add_parser("config", help="show or change display settings")
+    c.add_argument("key", nargs="?", choices=DEFAULT_KEYS)
+    c.add_argument("value", nargs="?", default="yes")
+
+    sub.add_parser("toggle", help="cycle device labels: names -> ip -> both")
+
+    n = sub.add_parser("name", help="give a device a nickname")
+    n.add_argument("action", choices=["set", "list", "remove"])
+    n.add_argument("ip", nargs="?")
+    n.add_argument("name", nargs="?", default="")
+
+    m = sub.add_parser("mac", help="look up a MAC address or OUI prefix")
+    m.add_argument("mac", help="aa:bb:cc:dd:ee:ff, aabbccddeeff, or an IP")
+    m.add_argument("--online", action="store_true",
+                   help="also query macvendors.com (off by default; sends the "
+                        "OUI prefix to a third party)")
+
+    r = sub.add_parser("record")
+    r.add_argument("--cidr", default=None,
+                   help="subnet to sweep (default: this host's subnet)")
+    r.add_argument("--sweep-interval", type=int, default=300)
+
+    live = sub.add_parser("live")
+    live.add_argument("--window", type=int, default=900)
+
+    args = ap.parse_args()
+    cmd = args.cmd or "live"
+
+    if cmd == "live":
+        dashboard(db.connect(), getattr(args, "window", 900))
+    elif cmd == "record":
+        cmd_record(args)
+    elif cmd == "reset":
+        cmd_reset(args)
+    elif cmd == "purge-reverse":
+        n = purge_reverse(db.connect())
+        print(f"removed {n} reverse-lookup rows")
+    elif cmd == "orbic":
+        cmd_orbic(args)
+    elif cmd == "config":
+        cmd_config(args)
+    elif cmd == "toggle":
+        cmd_toggle(args)
+    elif cmd == "setup":
+        sys.exit(cmd_setup(args))
+    elif cmd == "start":
+        sys.exit(service_action("start", args))
+    elif cmd == "stop":
+        sys.exit(service_action("stop", args))
+    elif cmd == "status":
+        sys.exit(service_action("status", args))
+    elif cmd == "name":
+        cmd_name(args)
+    elif cmd == "mac":
+        cmd_mac(args)
+    else:
+        conn = db.connect()
+        window = getattr(args, "hours", None)
+        window = window * 3600 if window else None
+        if cmd == "devices":
+            report.show_devices(conn, window)
+        elif cmd == "domains":
+            report.show_top_domains(conn, args.limit, window)
+        elif cmd == "blocked":
+            report.show_blocked_domains(conn, args.limit, window)
+        elif cmd == "client":
+            report.show_client(conn, args.ip, args.limit)
+        elif cmd == "shared":
+            report.show_shared(conn, args.limit)
+        elif cmd == "third-party":
+            report.show_third_party(conn, args.hours * 3600)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        sys.exit(0)

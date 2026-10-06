@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lanlog"
+version = "1.0.0"
+description = "See what devices on your LAN are talking to, right now (Pi-hole DNS logger + dashboard + tray)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "joebeezy" }]
+keywords = ["pihole", "dns", "lan", "network", "monitoring", "sysadmin"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Networking :: Monitoring",
+    "Environment :: Console",
+]
+# No runtime dependencies. Everything uses the standard library plus the system
+# tools listed below, which is deliberate: the tool has to run on a Pi or a
+# headless box without a pip install step.
+dependencies = []
+
+[project.optional-dependencies]
+# The tray icon needs PyGObject, which is a SYSTEM package on every distro and
+# is not installable from PyPI into a venv. Install it with your package
+# manager -- see install.sh --gui-deps.
+tray = []
+
+[project.urls]
+Homepage = "https://github.com/USERNAME/lanlog"
+
+[tool.setuptools]
+packages = ["lanlog"]

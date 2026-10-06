@@ -1,0 +1,23 @@
+# Runtime data -- never committed. The database holds your LAN's query history.
+lanlog.db
+lanlog.db-wal
+lanlog.db-shm
+*.db
+*.db-wal
+*.db-shm
+
+# Local config and caches
+.test-labels-config
+*.local
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Packaging leftovers
+*.tar.gz

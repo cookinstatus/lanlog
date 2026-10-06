@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Report whether this session has a usable system tray, and which kind.
+
+Prints one line of KEY=VALUE that install.sh reads, so the shell side does not
+have to reimplement dbus lookups. Kept separate because the interesting part --
+finding the process that owns a well-known bus name -- is awkward in shell.
+
+The detection is deliberately runtime-first. Asking "is X installed?" or "does
+this desktop normally have a tray?" is how you end up confidently wrong:
+
+  * GNOME has no tray of its own and removed it on purpose, so a GNOME install
+    with the AppIndicator extension reports a tray while plain GNOME does not.
+  * Hyprland, Sway, i3 and river have no tray host at all, but a user may be
+    running one alongside.
+  * A tray host can be a compositor, a panel, or a standalone app.
+
+So the question asked is the only one that matters: is something on this session
+bus currently providing the StatusNotifierWatcher interface that a tray icon
+registers with? If yes, an icon will appear. If no, none will, no matter what is
+installed.
+
+Detected tray hosts, by the process that owns the watcher bus name:
+  gnome-shell  GNOME, via the AppIndicator/AppIndicators extension
+  ksway        KDE Plasma
+  waybar       a Waybar config with the tray module enabled
+  yambar       a Yambar config with a tray plugin
+  stalonray    a standalone X11 tray host
+  dzen2 / tint2 / polybar   panel trays, usually via a systray applet
+  qs           Quickshell, a shell built on it
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+# bus name -> (human name, process names to match, how to get that process)
+# The process list is not exhaustive; anything owning the bus name is reported
+# by exe basename, so an unknown host is still identified as "something".
+KNOWN_HOSTS = {
+    "gnome-shell": "GNOME (AppIndicator extension)",
+    "ksway": "KDE Plasma",
+    "waybar": "Waybar",
+    "yambar": "Yambar",
+    "stalonray": "Stalonray",
+    "dzen2": "dzen2",
+    "tint2": "tint2",
+    "polybar": "Polybar",
+    "qs": "Quickshell",
+    "quickshell": "Quickshell",
+    "danklinux-shell": "Quickshell (DankLinux shell)",
+    "lxqt-panel": "LXQt panel",
+    "panel": "XFCE panel",
+    "mate-panel": "MATE panel",
+    "plasmashell": "KDE Plasma",
+    "cosmic-panel": "COSMIC panel",
+}
+
+# Desktops whose stock configuration has no tray. Used only to explain WHY when
+# nothing is found, never to claim a tray is absent on its own.
+NO_TRAY_DESKTOP = {
+    "hyprland": "Hyprland",
+    "sway": "Sway",
+    "i3": "i3",
+    "river": "river",
+    "niri": "niri",
+    "dwm": "dwm",
+    "wayfire": "Wayfire",
+    "labwc": "labwc",
+    "bspwm": "bspwm",
+    "awesome": "awesome",
+}
+
+
+def gdbus(*args):
+    """Run gdbus and return stdout, or '' on any failure."""
+    if not shutil.which("gdbus"):
+        return ""
+    try:
+        r = subprocess.run(["gdbus"] + list(args), capture_output=True,
+                           text=True, timeout=8)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def watcher_registered():
+    """True if a StatusNotifierHost is on the session bus right now."""
+    out = gdbus("call", "--session",
+                "--dest", "org.kde.StatusNotifierWatcher",
+                "--object-path", "/StatusNotifierWatcher",
+                "--method", "org.freedesktop.DBus.Properties.Get",
+                "org.kde.StatusNotifierWatcher",
+                "IsStatusNotifierHostRegistered")
+    return "<true>" in out.lower()
+
+
+def watcher_owner_pids():
+    """PIDs of the process owning the StatusNotifierWatcher bus name.
+
+    May return several: on some desktops the shell re-exports the name, and
+    gdbus prints a tuple. All of them are candidates for identification.
+    """
+    owner = gdbus("call", "--session",
+                  "--dest", "org.freedesktop.DBus",
+                  "--object-path", "/org/freedesktop/DBus",
+                  "--method", "org.freedesktop.DBus.GetNameOwner",
+                  "org.kde.StatusNotifierWatcher")
+    m = re.search(r":\d+\.\d+", owner)
+    if not m:
+        return []
+    out = gdbus("call", "--session",
+                "--dest", "org.freedesktop.DBus",
+                "--object-path", "/org/freedesktop/DBus",
+                "--method", "org.freedesktop.DBus.GetConnectionUnixProcessID",
+                m.group(0))
+    pids = []
+    for tok in re.findall(r"\d+", out):
+        # Skip the bus-name digits themselves (":1.148" -> 1, 148).
+        if int(tok) > 1 and int(tok) not in pids:
+            if os.path.isdir(f"/proc/{tok}"):
+                pids.append(int(tok))
+    return pids
+
+
+def proc_name(pid):
+    """Executable basename for a pid, or ''."""
+    try:
+        exe = os.readlink(f"/proc/{pid}/exe")
+        return os.path.basename(exe)
+    except OSError:
+        pass
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            raw = fh.read().split(b"\0")[0].decode("utf-8", "replace")
+        return os.path.basename(raw)
+    except OSError:
+        return ""
+
+
+def identify_host():
+    """A short human name for whatever owns the watcher, or ''."""
+    for pid in watcher_owner_pids():
+        name = proc_name(pid)
+        if not name:
+            continue
+        if name in KNOWN_HOSTS:
+            return KNOWN_HOSTS[name]
+        return f"{name} (unrecognised tray host)"
+    return ""
+
+
+def desktop():
+    v = os.environ.get("XDG_CURRENT_DESKTOP") or os.environ.get("DESKTOP_SESSION") or ""
+    return v.split(":")[0].strip()
+
+
+def gtk_gui_available():
+    """True if the system python can import gi and an indicator library."""
+    if not shutil.which("gdbus"):
+        pass
+    for py in ("/usr/bin/python3", sys.executable):
+        if not (py and os.path.exists(py)):
+            continue
+        try:
+            r = subprocess.run([py, "-c", "import gi"], capture_output=True,
+                               timeout=15)
+            if r.returncode != 0:
+                continue
+        except (OSError, subprocess.SubprocessError):
+            continue
+        try:
+            r = subprocess.run([py, "-c",
+                                "import gi\n"
+                                "for ns in ('AyatanaAppIndicator3','AppIndicator3'):\n"
+                                "    try:\n"
+                                "        gi.require_version(ns,'0.1')\n"
+                                "        __import__('gi.repository',fromlist=[ns])\n"
+                                "        print(ns); break\n"
+                                "    except Exception: pass\n"],
+                               capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if r.stdout.strip():
+            return True
+    return False
+
+
+def main():
+    have_gui = gtk_gui_available()
+    registered = watcher_registered() if have_gui else False
+    host = identify_host() if registered else ""
+    d = desktop()
+    low = d.lower()
+
+    if registered and host:
+        tray, why = "yes", f"{host} is providing a system tray"
+    elif registered:
+        tray, why = "yes", "a system tray is available"
+    elif have_gui:
+        tray, why = "no", "no tray host is running in this session"
+    else:
+        tray, why = "no-gui", "the tray icon's GUI packages are not installed"
+
+    # For the "why" when nothing was found, name the likely cause.
+    if not registered and d and low in NO_TRAY_DESKTOP:
+        why += f"; {NO_TRAY_DESKTOP[low]} has no tray of its own"
+
+    print(f"TRAY={tray}")
+    print(f"TRAY_HOST={host}")
+    print(f"TRAY_DESKTOP={d}")
+    print(f"TRAY_WHY={why}")
+    print(f"TRAY_GUI={'yes' if have_gui else 'no'}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
