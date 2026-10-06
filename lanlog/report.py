@@ -661,7 +661,10 @@ def show_client(conn, ip, limit=40):
     width = _term_width()
     compact = width < 104
     dom_w = 30 if compact else 44
-    addr_w = 26 if compact else 40
+    # Derived from the width, not fixed: at 76 columns a fixed 26 still
+    # overflowed by two characters.
+    addr_w = max(10, width - dom_w - (1 + 6 + 1 + (6 if compact else 8)
+                                      + 2 + 9 + 1))
     qcol = 6 if compact else 8
     head = f"{'domain':<{dom_w}} {'type':<6} {'queries':>{qcol}}  {'last':<9} address"
     print(head)
