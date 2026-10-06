@@ -165,7 +165,12 @@ def show_devices(conn, window=None):
     # truncated the address straight off the end of every row -- cutting off the
     # one half of that mode that exists to be seen.
     dev_w = 44 if mode == "ip" else max([24] + [len(x) for x in labels])
-    dev_w = min(dev_w, 62)
+    # Cap against the terminal, not just a constant: on an 80-column screen a
+    # 62-wide device column plus the ip/last-seen/now columns overflows and the
+    # rows wrap. The cap leaves room for the fixed columns.
+    width = _term_width()
+    fixed_w = 2 + 15 + 2 + 11 + 2 + 5 + 7 if mode == "names" else 2 + 11 + 2 + 5 + 7
+    dev_w = min(dev_w, 62, max(20, width - fixed_w))
     show_ip = mode == "names"
 
     if show_ip:
@@ -220,7 +225,35 @@ def _verdict_header(with_ips=False):
             "-" * (80 + ips_sep), True)
 
 
-def _answers_for(conn, qnames, max_shown=3):
+def _term_width(default=100):
+    """Usable terminal width. Honours $COLUMNS, so piping and tests are stable."""
+    try:
+        import shutil
+
+        return shutil.get_terminal_size((default, 24)).columns
+    except Exception:  # noqa: BLE001 - a width is never worth failing a report
+        return default
+
+
+def _shape_addresses(ips, width):
+    """Fit a name's addresses into `width`, dropping addresses until they fit.
+
+    A raw join can be 200 characters (youtube resolves to 16 addresses), and
+    padding does not truncate -- so the row silently overflowed its column and
+    the terminal wrapped it. Reducing the count until the string fits keeps the
+    column honest: what is shown is real, and the `(+N more)` says what is not.
+    """
+    if not ips:
+        return "-"
+    for n in range(len(ips), 0, -1):
+        shown = ", ".join(ips[:n])
+        cand = shown if n == len(ips) else f"{shown} (+{len(ips) - n} more)"
+        if len(cand) <= width:
+            return cand
+    return ips[0][:max(1, width)]
+
+
+def _answers_for(conn, qnames, max_shown=3, width=None):
     """{qname: "ip1, ip2, ip3 (+13 more)"} for the names given, best-effort.
 
     Addresses come from the `answers` table (the log's reply/cached lines). A
@@ -228,10 +261,8 @@ def _answers_for(conn, qnames, max_shown=3):
     nothing is honest, and the alternative (guessing, or leaving a stale address
     in place) is not.
 
-    Capped, because a CDN name resolves to a dozen addresses and an uncapped
-    column turns one row into a wall of text that pushes every other row off the
-    screen. The count of what was omitted is kept so the truncation is visible
-    rather than silently pretending there were only three.
+    With `width`, the string is shaped to fit that many columns exactly (see
+    _shape_addresses); without it, `max_shown` addresses are shown plus a count.
 
     Tolerant of a database without the table: a viewer pointed at an older
     lanlog.db, or any foreign database, must still render its reports rather
@@ -256,17 +287,25 @@ def _answers_for(conn, qnames, max_shown=3):
             out.setdefault(qname, []).append(ip)
     shaped = {}
     for qname, ips in out.items():
-        if len(ips) > max_shown:
-            extra = len(ips) - max_shown
-            shaped[qname] = f"{', '.join(ips[:max_shown])} (+{extra} more)"
+        if width:
+            shaped[qname] = _shape_addresses(ips, width)
+        elif len(ips) > max_shown:
+            shaped[qname] = (f"{', '.join(ips[:max_shown])} "
+                             f"(+{len(ips) - max_shown} more)")
         else:
             shaped[qname] = ", ".join(ips)
     return shaped
 
 
 def show_top_domains(conn, limit=25, window=None, show_ips=True):
-    """Busiest domains overall, with the addresses they resolved to and whether
-    Pi-hole blocked them."""
+    """Busiest domains, each with the addresses it resolved to and its verdict.
+
+    The address sits immediately after the domain rather than at the end of the
+    line: appended last, it landed past the queries and devices columns and read
+    as belonging to nothing. The whole table is sized to the terminal, because a
+    140-character row on an 80-column screen wraps and turns the report into
+    noise -- which is what the address column looked like when it was added.
+    """
     from lanlog import blocking
 
     sql = "SELECT qname, COUNT(*) c, COUNT(DISTINCT client) n FROM queries"
@@ -279,25 +318,62 @@ def show_top_domains(conn, limit=25, window=None, show_ips=True):
     if not rows:
         print("no queries recorded yet")
         return
-    head, sep, show_block = _verdict_header(show_ips)
+
+    width = _term_width()
+    table = _block_table()
+    show_block = bool(table)
+    # Derive the columns from the real suffix lengths rather than fixed numbers.
+    # The header ends in "  blocked by" (12 chars) while a compact row ends in
+    # "  BLK" (5), and a fixed address width overflowed at any terminal narrower
+    # than the sum -- which is the wrapping this is meant to prevent.
+    blk_full = "  blocked by" if show_block else ""
+    blk_short = "  BLK" if show_block else ""
+    # non-compact: domain + addr + ' queries' + ' devices' + blk_full
+    over_full = 1 + 1 + 8 + 1 + 8 + len(blk_full)
+    # compact: domain + addr + ' queries' + blk_short
+    over_compact = 1 + 1 + 8 + len(blk_short)
+    compact = (width - 44 - over_full) < 18
+    dom_w = 30 if compact else 44
+    overhead = over_compact if compact else over_full
+    addr_w = max(0, width - dom_w - overhead)
+    if addr_w < 14:
+        # Still tight: give the domain less room so the address survives, since
+        # the address is the reason this column exists.
+        dom_w = max(18, width - overhead - 14)
+        addr_w = max(0, width - dom_w - overhead)
+    show_ips = show_ips and addr_w >= 10
+    n_ips = 1 if compact else 3
+
+    head = f"{'domain':<{dom_w}}"
+    if show_ips:
+        head += f" {'address':<{addr_w}}"
+    head += f" {'queries':>7}"
+    if not compact:
+        head += f" {'devices':>7}"
+    if show_block:
+        head += "  blk" if compact else "  blocked by"
     print(head)
-    print(sep)
-    table = _block_table() if show_block else None
-    ips = _answers_for(conn, [r[0] for r in rows]) if show_ips else {}
+    print("-" * min(width, len(head)))
+
+    ips = _answers_for(conn, [r[0] for r in rows], width=addr_w) \
+        if show_ips else {}
     for qname, c, n in rows:
-        # The address column is appended LAST and never truncated: the domain is
-        # already clipped at 50, and a half-shown address is worse than none.
-        line = f"{qname[:50]:<50} {c:>8} {n:>8}"
+        line = f"{qname[:dom_w]:<{dom_w}}"
         if show_ips:
-            line += f"  {ips.get(qname, '-')}"
+            # Never truncated: a half-shown address is worse than none.
+            line += f" {ips.get(qname, '-'):<{addr_w}}"
+        line += f" {c:>7}"
+        if not compact:
+            line += f" {n:>7}"
         if show_block:
             match = blocking.blocked_by(qname, table)
             # A colour alone is unreadable to anyone whose terminal does not
             # render it, so the mark is a word first and colour second.
             if match:
-                line += "  " + _c("BLOCKED", "1;31") + " by " + match[:28]
+                line += ("  " + _c("BLK", "1;31")) if compact else (
+                    "  " + _c("BLOCKED", "1;31") + " by " + match[:28])
             else:
-                line += "  " + _c("ok", "32")
+                line += "  " + _c("ok" if compact else "ok", "32")
         print(line)
 
 
@@ -450,10 +526,15 @@ def show_blocked_domains(conn, limit=25, window=None):
     rows.sort(key=lambda r: -r[1])
     rows = rows[:limit]
     n_blocked_rows = sum(r[1] for r in rows)
-    print(f"{'domain':<50} {'queries':>8} {'devices':>8}  blocked by")
-    print("-" * 88)
+    # Sized to the terminal; the fixed 88-column table wrapped on an 80-column
+    # screen.
+    width = _term_width()
+    dom_w = 30 if width < 104 else 44
+    by_w = 24 if width < 104 else 30
+    print(f"{'domain':<{dom_w}} {'queries':>7} {'devices':>7}  blocked by")
+    print("-" * min(width, dom_w + 30 + by_w))
     for qname, c, n, match, last in rows:
-        print(f"{qname[:50]:<50} {c:>8} {n:>8}  {match[:30]}")
+        print(f"{qname[:dom_w]:<{dom_w}} {c:>7} {n:>7}  {match[:by_w]}")
     print(f"\n{len(rows)} blocked domain(s), {n_blocked_rows} queries stopped"
           f"   (showing top {limit})")
 
@@ -497,11 +578,27 @@ def show_resolve(conn, name=None, limit=25, window=None):
         print(" the logger may have been started before this feature existed)")
         return
 
-    print(f"{'domain':<46} {'address':<40} {'type':<5} {'last':<9} hits")
-    print("-" * 110)
-    for qname, ip, qtype, kind, _first, last, hits in rows:
-        print(f"{qname[:46]:<46} {ip[:40]:<40} {str(qtype or ''):<5} "
-              f"{_fmt_clock(last):<9} {hits}")
+    # Sized to the terminal. In compact mode the `type` and `hits` columns go:
+    # the address is the reason to run this command, so it keeps the room.
+    width = _term_width()
+    compact = width < 104
+    dom_w = 28 if compact else 42
+    addr_w = 34 if compact else 44
+    if compact:
+        head = f"{'domain':<{dom_w}} {'address':<{addr_w}} last"
+        print(head)
+        print("-" * min(width, len(head)))
+        for qname, ip, _qtype, _kind, _first, last, _hits in rows:
+            print(f"{qname[:dom_w]:<{dom_w}} {ip[:addr_w]:<{addr_w}} "
+                  f"{_fmt_clock(last)}")
+    else:
+        head = (f"{'domain':<{dom_w}} {'address':<{addr_w}} {'type':<5} "
+                f"{'last':<9} hits")
+        print(head)
+        print("-" * min(width, len(head)))
+        for qname, ip, qtype, _kind, _first, last, hits in rows:
+            print(f"{qname[:dom_w]:<{dom_w}} {ip[:addr_w]:<{addr_w}} "
+                  f"{str(qtype or ''):<5} {_fmt_clock(last):<9} {hits}")
     n_names = len({r[0] for r in rows})
     print(f"\n{len(rows)} address(es) across {n_names} name(s)")
 
@@ -520,12 +617,20 @@ def show_client(conn, ip, limit=40):
     name = _label({"ip": ip}, names, mode)
     total = sum(r[2] for r in rows)
     print(f"{name}  ({ip}): {total} queries, top {len(rows)}")
-    print(f"{'domain':<50} {'type':<6} {'queries':>8}  {'last':<9} address")
-    print("-" * 118)
-    ips = _answers_for(conn, [r[0] for r in rows])
+    # Sized to the terminal: the fixed widths here produced a 128-column row,
+    # which wrapped on an 80-column screen and made the table unreadable.
+    width = _term_width()
+    compact = width < 104
+    dom_w = 30 if compact else 44
+    addr_w = 26 if compact else 40
+    qcol = 6 if compact else 8
+    head = f"{'domain':<{dom_w}} {'type':<6} {'queries':>{qcol}}  {'last':<9} address"
+    print(head)
+    print("-" * min(width, len(head)))
+    ips = _answers_for(conn, [r[0] for r in rows], width=addr_w)
     for qname, qtype, c, last in rows:
-        print(f"{qname[:50]:<50} {qtype:<6} {c:>8}  {_fmt_clock(last):<9} "
-              f"{ips.get(qname, '-')}")
+        print(f"{qname[:dom_w]:<{dom_w}} {qtype:<6} {c:>{qcol}}  "
+              f"{_fmt_clock(last):<9} {ips.get(qname, '-')}")
 
 
 def show_shared(conn, limit=30):
@@ -539,10 +644,12 @@ def show_shared(conn, limit=30):
     if not rows:
         print("no multi-device domains yet")
         return
-    print(f"{'domain':<46} {'devices':>7} {'queries':>7}  last")
-    print("-" * 78)
+    width = _term_width()
+    dom_w = 40 if width < 104 else 46
+    print(f"{'domain':<{dom_w}} {'devices':>7} {'queries':>7}  last")
+    print("-" * min(width, dom_w + 26))
     for qname, n, c, last in rows:
-        print(f"{qname[:46]:<46} {n:>7} {c:>7}  {_fmt_clock(last)}")
+        print(f"{qname[:dom_w]:<{dom_w}} {n:>7} {c:>7}  {_fmt_clock(last)}")
 
 
 def show_third_party(conn, window=86400):

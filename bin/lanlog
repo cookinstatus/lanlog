@@ -230,7 +230,6 @@ def dashboard(conn, window=900):
             # walk for every row on every repaint of a dashboard that repaints
             # every second.
             verdicts = _block_verdicts([r[3] for r in fresh])
-            addresses = report._answers_for(conn, [r[3] for r in fresh])
 
             # Choose banner size so the whole view fits the terminal. On a
             # standard 80x24 the full 14-row banner does not fit and the
@@ -358,17 +357,45 @@ def dashboard(conn, window=900):
 
             if fresh:
                 out.append(_c(" LATEST QUERIES", BOLD))
+                # Build the row to fit the terminal exactly. Fixed widths used
+                # to produce a ~140-column row, which wrapped on an 80-column
+                # screen and pushed the address onto a line of its own.
+                #
+                # When space is tight the columns yield in priority order. The
+                # address is what was asked for, so it stays; the timestamp and
+                # the query type are the first to go, because "who asked for
+                # what, and where does it point" is the question this panel
+                # exists to answer.
+                term_w = _term_cols()
+                tcol, qcol, mcol = 9, 6, 8          # time, qtype, block mark
+                dw = 20 if labels == "names" else min(30, max(15, term_w // 5))
+                tight = term_w < 104
+                head_over = 1 + dw + 1 + mcol
+                if not tight:
+                    head_over += tcol + 1 + qcol + 1
+                avail = max(24, term_w - head_over - 1)
+                dom_w = max(18, min(44, avail // 2))
+                addr_w = max(0, avail - dom_w)
+                show_addr = addr_w >= 14
+                if not show_addr:
+                    dom_w = max(18, min(44, avail))
+                addrs = report._answers_for(
+                    conn, [r[3] for r in fresh],
+                    width=addr_w if show_addr else 0) if show_addr else {}
                 for ts, client, qtype, qname in fresh:
-                    dw = 24 if labels == "names" else 38
-                    # The resolved address comes from a single lookup for the
-                    # whole frame (see report.latest_rows); a per-row query on a
-                    # view that repaints every second would repeat the same walk.
-                    addr = addresses.get(qname, "")
-                    out.append(f" {report._fmt_clock(ts):<9} "
-                               f"{_dev(client, dw):<{dw}} {qtype:<6} "
-                               f"{_block_mark(verdicts.get(qname))}"
-                               f"{qname[:40]}"
-                               + (f"  {_c(addr, DIM)}" if addr else ""))
+                    addr = addrs.get(qname, "") if show_addr else ""
+                    if tight:
+                        line = (f" {_dev(client, dw):<{dw}} "
+                                f"{_block_mark(verdicts.get(qname))}"
+                                f"{qname[:dom_w]}")
+                    else:
+                        line = (f" {report._fmt_clock(ts):<{tcol}} "
+                                f"{_dev(client, dw):<{dw}} {qtype:<{qcol}} "
+                                f"{_block_mark(verdicts.get(qname))}"
+                                f"{qname[:dom_w]}")
+                    if addr:
+                        line += f" {_c(addr[:addr_w], DIM)}"
+                    out.append(line)
                 out.append("")
 
             if last_cmd:
@@ -448,6 +475,11 @@ def dashboard(conn, window=900):
             print("\n".join(out))
 
             bar, active = keys.bar()
+            # When the bar is just the idle hint, it is shortened to fit rather
+            # than allowed to wrap and push the display off screen. An active
+            # command or an open menu is never truncated -- that is live input.
+            if not active and bar == keys_mod.BAR_HINT:
+                bar = _key_bar()
             print(_c(bar, DIM) if not active else _c(bar, YEL + BOLD))
             sys.stdout.flush()
 
@@ -472,6 +504,36 @@ def _term_rows():
         return os.get_terminal_size().lines
     except OSError:
         return 24
+
+
+def _term_cols():
+    """Terminal width, defaulting to 100 when it cannot be determined.
+
+    Uses shutil, not os.get_terminal_size, because shutil honours $COLUMNS --
+    without which the width is untestable when output is piped, and the layout
+    cannot be checked at a size other than the real one.
+    """
+    import shutil
+
+    return shutil.get_terminal_size((100, 24)).columns
+
+
+def _key_bar():
+    """The dashboard's key hint, shortened to fit the terminal.
+
+    The full hint is 98 columns, so on an 80-column terminal it wrapped onto a
+    second line and pushed the bottom of the display off the screen.
+    """
+    from lanlog import keys as k
+
+    full = k.BAR_HINT
+    if len(full) <= _term_cols():
+        return full
+    short = ("  [1]dev  [2]dom  [3]shared  [4]3rd  [5]client  [6]names  "
+             "[7]set  [0]labels  Esc quit")
+    if len(short) <= _term_cols():
+        return short
+    return "  [1]-[7] commands   Esc quit"
 
 
 def _run_quick(conn, cmd):
