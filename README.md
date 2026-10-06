@@ -116,6 +116,21 @@ This only applies when Pi-hole runs on this machine. Set `pihole_host` in
 then treated as an unmappable link-local on that side and dropped, because it
 cannot be matched to anything on this LAN.
 
+## Blocked domains
+
+`lanlog blocked` (and the dashboard's BLOCKED marks) reads Pi-hole's gravity
+database. That file is mode 0640 owned by the container's internal `pihole`
+user, so a plain host read fails with a permission error even though it lives
+under your home directory. lanlog therefore reads it *through the container*,
+using the `sqlite3` that Pi-hole ships inside `pihole-FTL` — the same `podman
+exec` transport the query log uses, so it needs no extra permissions and no
+changes to Pi-hole. Point it elsewhere with `LANLOG_GRAVITY_DB` if your Pi-hole
+is not reachable that way.
+
+A domain counts as blocked if it, or any parent of it, is listed — matching how
+dnsmasq evaluates the lists — and the report names the listed domain that caught
+it, which is the actionable half of the answer.
+
 ## Notes on this setup
 
 - **Pi-hole v6 has no dnstap.** Upstream dropped it; the FTL binary has zero

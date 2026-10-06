@@ -149,6 +149,37 @@ def main():
         else:
             os.environ["LANLOG_GRAVITY_DB"] = saved
 
+    # The gravity database is mode 0640 owned by the container's pihole uid, so
+    # a host read fails with a bare permission error. That failure was silent:
+    # `lanlog blocked` reported the blocklist as unavailable on a working
+    # install. The fallback must reach it through the container instead.
+    print("\ngravity readable only through the container:")
+    real_connect = blocking.sqlite3.connect
+
+    def deny(*_a, **_k):
+        raise blocking.sqlite3.OperationalError("unable to open database file")
+
+    blocking.sqlite3.connect = deny
+    blocking._cache["domains"] = frozenset()
+    blocking._cache["stamp"] = None
+    try:
+        if blocking.gravity_path() is None:
+            print("  skip  no gravity.db on this machine")
+        elif blocking._runtime() is None:
+            print("  skip  no container runtime on this machine")
+        else:
+            doms = blocking.domains(force=True)
+            passed &= check("container fallback found domains",
+                            len(doms) > 1000, True)
+            # A domain that ships in every default Pi-hole blocklist.
+            passed &= check("blocked_by works off the fallback",
+                            blocking.blocked_by("ads.doubleclick.net", doms),
+                            "doubleclick.net")
+    finally:
+        blocking.sqlite3.connect = real_connect
+        blocking._cache["domains"] = frozenset()
+        blocking._cache["stamp"] = None
+
     ks.stream.close()
     print("\n" + ("ALL PASS" if passed else "FAILURES PRESENT"))
     return 0 if passed else 1

@@ -31,7 +31,9 @@ viewer must never take a write lock against FTL.
 """
 
 import os
+import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 
@@ -44,6 +46,9 @@ CANDIDATES = (
     os.path.expanduser("~/podman/pihole/etc-pihole/gravity.db"),
     "/etc/pihole/gravity.db",
 )
+
+# Container runtime candidates, used when the file cannot be read directly.
+_RUNTIMES = ("podman", "docker")
 
 # How long a failed lookup is cached before retrying. Gravity can appear after
 # lanlog starts (Pi-hole pulled later, mount created later), so a miss must not
@@ -69,6 +74,58 @@ def gravity_path():
         if os.path.exists(path):
             return path
     return None
+
+
+def _container_name():
+    """Pi-hole's container name, from the same detection the rest of lanlog uses."""
+    env = os.environ.get("LANLOG_CONTAINER")
+    if env:
+        return env
+    try:
+        from lanlog import config as lcfg
+
+        return lcfg.get("container") or "pihole"
+    except Exception:  # noqa: BLE001 - detection is best-effort
+        return "pihole"
+
+
+def _runtime():
+    """podman if present, else docker, else None."""
+    for rt in _RUNTIMES:
+        if shutil.which(rt):
+            return rt
+    return None
+
+
+def _gravity_via_container():
+    """Read the blocked-domain list through Pi-hole's own container.
+
+    The database is mode 0640 owned by the container's internal pihole user
+    (uid 525287 here), which the host user cannot read even though the file
+    lives under their home -- so the direct sqlite3 path fails with a bare
+    permission error and the blocklist silently reads as unavailable.
+
+    Pi-hole ships sqlite3 INSIDE pihole-FTL, so the same query runs in the
+    container, as root, over `podman exec`. That is the same transport the query
+    log already uses, so it needs no extra permissions and no changes to
+    Pi-hole. Returns the set of domains, or None if it could not be read.
+    """
+    rt = _runtime()
+    if not rt:
+        return None
+    container = _container_name()
+    cmd = [rt, "exec", container, "pihole-FTL", "sqlite3", "-readonly",
+           "/etc/pihole/gravity.db", "SELECT domain FROM gravity;"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return frozenset(
+        line.strip().lower().rstrip(".")
+        for line in proc.stdout.splitlines() if line.strip()
+    )
 
 
 def _stamp(path):
@@ -104,6 +161,10 @@ def domains(force=False):
                 and _cache["domains"]):
             return _cache["domains"]
 
+        rows = None
+        # Direct read first: it is the fastest path and needs no container. It
+        # fails on a stock rootless-podman install, where the file is owned by
+        # the container's pihole uid, so the container read is the real one.
         try:
             conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
             try:
@@ -111,7 +172,17 @@ def domains(force=False):
             finally:
                 conn.close()
         except sqlite3.Error:
-            return _cache["domains"]
+            rows = None
+
+        if rows is None:
+            via = _gravity_via_container()
+            if via is None:
+                return _cache["domains"]
+            _cache["domains"] = via
+            _cache["path"] = path
+            _cache["stamp"] = stamp
+            _cache["loaded"] = time.time()
+            return via
 
         # Pi-hole stores gravity lowercased, but a hand-added entry can differ in
         # case; normalise on load so a lookup never misses on case alone.
