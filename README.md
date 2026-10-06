@@ -10,15 +10,31 @@ Reads Pi-hole's query log (streamed via `podman exec`, so no permission or
 firewall changes needed) plus a periodic ARP sweep for device identity.
 Everything lands in a local SQLite database at `./lanlog.db`.
 
+## Requirements
+
+- Linux, Python 3.9+ — standard library only, nothing to `pip install`.
+- Pi-hole running in a container (podman or docker) on this machine. The tool
+  reads Pi-hole's query log by streaming it through `podman exec`, so it needs
+  no extra permissions and no changes to Pi-hole.
+- `ip`, `ping` and `dig` for device discovery and name resolution
+  (iproute2, iputils, and bind-utils/dnsutils or equivalent).
+- For the tray only: GTK3 + PyGObject and an appindicator library, plus a
+  system tray host. `./install.sh --gui-deps` prints the package names.
+
 ## Install
 
+    git clone https://github.com/cookinstatus/lanlog
+    cd lanlog
     ./install.sh              # launchers, icon, autostart
-    ./install.sh --gui-deps   # offer to install GTK/PyGObject for the tray
+    ./install.sh --gui-deps   # also offer to install GTK/PyGObject for the tray
 
 Then start the logger so data accumulates without a dashboard open:
 
     lanlog start
     journalctl --user -u lan-logger -f
+
+If Pi-hole is not on this machine, see `lanlog setup` and the `pihole_host`
+setting in `~/.config/lanlog/config`.
 
 ## Use
 
