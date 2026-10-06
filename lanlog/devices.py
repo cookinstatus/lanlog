@@ -28,8 +28,6 @@ MAC_CLEAN = re.compile(r"[^0-9a-fA-F]")
 # --------------------------------------------------------------------------
 
 DEFAULT_CONFIG = {
-    # Show the vendor/hint suffix next to a device name.
-    "show_kinds": "yes",
     # Hide devices that have never been seen talking to anything.
     "hide_idle": "no",
     # Include these comma-separated prefixes in `lanlog devices`.
@@ -56,7 +54,6 @@ DEFAULT_CONFIG = {
 LABEL_MODES = ("names", "ip", "both")
 
 CHOICES = {
-    "show_kinds": ("yes", "no"),
     "hide_idle": ("yes", "no"),
     "labels": LABEL_MODES,
 }

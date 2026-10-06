@@ -16,7 +16,8 @@ import time
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 
-from lanlog import db, discover, ingest, orbic  # noqa: E402
+from lanlog import config as lcfg  # noqa: E402
+from lanlog import db, discover, ingest  # noqa: E402
 
 _running = True
 
@@ -24,6 +25,22 @@ _running = True
 # alone missed the v6 half, so match the gateway MAC too.
 GATEWAY_MAC = "0c:7f:b2:c0:55:68"
 GATEWAYS = {"192.168.1.254", "2600:1700:4c50:6be0::1"}
+
+
+def _apply_ingest_settings():
+    """Push the resolved Pi-hole host into ingest before the first line.
+
+    ingest decides at import time whether a link-local source is this machine's
+    own traffic or an unmappable local link, and it reads LANLOG_PIHOLE_HOST for
+    that. The value can come from the config file as well as the environment, so
+    it is written into the environment here, before any query is classified.
+    """
+    host = (os.environ.get("LANLOG_PIHOLE_HOST")
+            or lcfg.get("pihole_host") or "")
+    os.environ["LANLOG_PIHOLE_HOST"] = host
+    ingest.PIHOLE_HOST = host.strip().lower()
+    ingest.IN_CONTAINER = ingest.PIHOLE_HOST in ("", "localhost",
+                                                 "127.0.0.1", "::1")
 
 
 def _stop(*_):
@@ -85,36 +102,6 @@ def discovery_loop(conn_factory, cidr, interval, verbose):
             time.sleep(1)
 
 
-def orbic_loop(conn_factory, host, interval, log=None, verbose=False):
-    """Poll the Orbic's DNS sniffer log over SSH and record what it finds.
-
-    Disabled unless --orbic-host is given, since the hotspot is not always
-    reachable (it is mobile).
-    """
-    conn = conn_factory()
-    while _running:
-        try:
-            lines = orbic.pull(host, log=log)
-            got = 0
-            for line in lines:
-                rec = orbic.parse_line(line)
-                if rec is None:
-                    continue
-                ts, client, qname, qtype, outcome = rec
-                db.record_query(conn, ts, client, qname, qtype, outcome,
-                                source="orbic")
-                got += 1
-            if verbose and got:
-                print(f"[orbic] {got} queries from {host}", flush=True)
-        except Exception as exc:  # noqa: BLE001 - hotspot may vanish mid-poll
-            print(f"[orbic] {host}: {exc}", file=sys.stderr)
-
-        for _ in range(int(interval)):
-            if not _running:
-                return
-            time.sleep(1)
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cidr", default=None,
@@ -122,16 +109,14 @@ def main():
     ap.add_argument("--sweep-interval", type=int, default=300,
                     help="seconds between ping sweeps (0 = discovery off)")
     ap.add_argument("--container", default="pihole")
-    ap.add_argument("--orbic-host", default=os.environ.get("ORBIC_HOST"),
-                    help="hotspot IP to pull DNS logs from")
-    ap.add_argument("--orbic-log", default=None,
-                    help="log path on the hotspot (auto-detected if omitted)")
-    ap.add_argument("--orbic-interval", type=int, default=60)
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
+
+    # Must run before the first log line is classified.
+    _apply_ingest_settings()
 
     conn = db.connect()
     discover.load_oui()
@@ -141,16 +126,6 @@ def main():
         t = threading.Thread(
             target=discovery_loop,
             args=(db.connect, args.cidr, args.sweep_interval, args.verbose),
-            daemon=True,
-        )
-        t.start()
-        threads.append(t)
-
-    if args.orbic_host:
-        t = threading.Thread(
-            target=orbic_loop,
-            args=(db.connect, args.orbic_host, args.orbic_interval,
-                  args.orbic_log, args.verbose),
             daemon=True,
         )
         t.start()

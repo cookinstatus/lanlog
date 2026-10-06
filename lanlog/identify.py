@@ -120,19 +120,9 @@ def _clean_hostname(name):
     return name
 
 
-# Whether the "(Vendor)" hint is appended to a resolved name. Set from the
-# `show_kinds` setting so every surface agrees -- the setting used to be read
-# only by report.py, so it silently did nothing on the live dashboard and in the
-# tray, both of which resolve names through this module.
-_SHOW_KINDS = True
-
-
-def _set_kinds(flag):
-    """Turn the '(Vendor)' hint on or off for every caller of describe()."""
-    global _SHOW_KINDS
-    _SHOW_KINDS = bool(flag)
-
-
+# Whether the "(Vendor)" hint is appended to a resolved name.
+# The `show_kinds` setting was removed, so the hint is always shown: it is the
+# only thing that makes a router-assigned name like ATT_4991_f91139 legible.
 def _guess_kind(hostname):
     """Turn a DHCP name into a friendly hint, when the name is just an ID."""
     if not hostname:
@@ -203,6 +193,12 @@ def describe(ip, mac=None, vendor=None, aliases=None, use_mdns=True):
     if cached is not None:
         return cached
 
+    # The machine running the logger. Its traffic is folded to this one label at
+    # ingest (see ingest.attribute_host), so it is named here rather than
+    # resolved: there is no DHCP lease or mDNS record for a container's gateway.
+    if ip == "localhost":
+        return "this machine", "self"
+
     aliases = load_aliases() if aliases is None else aliases
     if ip in aliases:
         result = (aliases[ip], "alias")
@@ -211,14 +207,14 @@ def describe(ip, mac=None, vendor=None, aliases=None, use_mdns=True):
 
     md = mdns_ptr(ip) if use_mdns else None
     if md:
-        kind = _guess_kind(md) if _SHOW_KINDS else None
+        kind = _guess_kind(md)
         result = (f"{md} ({kind})" if kind else md), "mdns"
         _cache_put(ip, *result)
         return result
 
     ptr = router_ptr(ip)
     if ptr:
-        kind = _guess_kind(ptr) if _SHOW_KINDS else None
+        kind = _guess_kind(ptr)
         result = (f"{ptr} ({kind})" if kind else ptr), "router"
         _cache_put(ip, *result)
         return result

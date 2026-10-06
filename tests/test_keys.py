@@ -224,7 +224,7 @@ def main():
     passed &= check("Esc at menu did not quit", ks.pending, None)
 
     # A blank value still fires, so "only" can be cleared.
-    ks = make_keys([b"75\n"])
+    ks = make_keys([b"74\n"])
     feed(ks, b"x")
     passed &= check("blank value fires", ks.pending, "config only")
 
@@ -245,7 +245,7 @@ def main():
         "CONFIG_MENU NOT on instance (guards the wrong attr access)",
         hasattr(bare, "CONFIG_MENU"), False,
     )
-    passed &= check("menu row count", len(k.CONFIG_MENU) + 3, 9)
+    passed &= check("menu row count", len(k.CONFIG_MENU) + 3, 8)
 
     # The labels toggle. [0] runs it straight from the bar, and it must reach
     # every mode -- including back round to the start -- because a single

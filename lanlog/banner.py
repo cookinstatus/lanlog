@@ -117,9 +117,9 @@ def banner_lines(rng=None):
 
 HELP = [
     "devices  inventory      name set <ip> \"nick\"   mac <mac-or-ip>",
-    "domains  top queries    name list                orbic probe",
-    "client <ip>              config [key val]        orbic status",
-    "shared   multi-device   third-party             Ctrl-C to quit",
+    "domains  top queries    name list                toggle labels",
+    "client <ip>              config [key val]        Ctrl-C to quit",
+    "shared   multi-device   third-party",
 ]
 
 

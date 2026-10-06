@@ -190,12 +190,6 @@ def dashboard(conn, window=900):
             query_lines = devcfg.get_int(cfg, "query_lines")
             refresh = devcfg.get_int(cfg, "refresh")
             labels = devcfg.label_mode(cfg)
-            # show_kinds is applied to the resolver itself, not at render time:
-            # the dashboard labels come from identify.describe(), so setting the
-            # flag here is what makes the setting actually affect this screen.
-            identify._set_kinds(
-                cfg.get("show_kinds", "yes").lower() not in ("no", "false", "0")
-            )
 
             total = conn.execute("SELECT COUNT(*) FROM queries").fetchone()[0]
             recent = conn.execute(
@@ -556,72 +550,6 @@ def cmd_reset(args):
         print("removed", p)
 
 
-def cmd_orbic(args):
-    """Inspect the hotspot's DNS log over SSH."""
-    from lanlog import db, orbic
-
-    host = args.host
-    action = args.action
-    if action == "probe":
-        print(f"SSHing to {host} ...", flush=True)
-        rc, out = orbic.ssh(host, "uname -a")
-        if rc != 0:
-            print(f"  ssh failed (rc={rc}): {out.strip()}")
-            print("  Is the hotspot in range and is key-based root login "
-                  "working?")
-            return
-        print(f"  connected: {out.strip().splitlines()[0] if out.strip() else '?'}")
-        # find_log() returns a path string or None -- it does NOT return a
-        # (path, rc) pair. Unpacking it raised "too many values to unpack" on
-        # every successful probe, i.e. whenever the hotspot was actually in
-        # range. Verified against the function's own contract.
-        log = orbic.find_log(host)
-        if not log:
-            print("  no known log path found; try --log /path/to/file")
-            return
-        print(f"  log: {log}")
-        # probe() returns (path, lines). Assigning the pair to `lines` then
-        # iterating it walked the tuple, not the log -- and the loop below
-        # printed nothing because neither element is a log line.
-        _path, lines = orbic.probe(host, log, lines=args.lines)
-        if not lines:
-            print("  (log is empty -- is the DNS sniffer enabled in DagShell?)")
-            return
-        print("  raw lines -- add a regex to lanlog/orbic.py if these "
-              "don't parse:")
-        for line in lines:
-            rec = orbic.parse_line(line)
-            tag = "OK  " if rec else "MISS"
-            print(f"  {tag} {line.rstrip()}")
-            if rec:
-                # parse_line returns a 5-tuple (ts, client, qname, qtype,
-                # outcome), not a dict. Indexing it by name raised TypeError.
-                ts, client, qname, qtype, _outcome = rec
-                print(f"         -> {client} {qname}  ({qtype})")
-
-    elif action == "sources":
-        rc, out = orbic.ssh(host, "ls -1 /var/log/*.log 2>/dev/null")
-        print("  log files on the hotspot:" if out.strip()
-              else "  (no /var/log/*.log, or ssh failed)")
-        for line in out.splitlines():
-            print(f"    {line.strip()}")
-
-    elif action == "status":
-        conn = db.connect()
-        rows = conn.execute(
-            "SELECT client, qname, ts FROM queries WHERE source='orbic' "
-            "ORDER BY ts DESC LIMIT 15"
-        ).fetchall()
-        if not rows:
-            print("no orbic data yet -- start the service with ORBIC_HOST set")
-            return
-        now = time.time()
-        print(f"{'client':<16} {'domain':<40}  age")
-        print("-" * 66)
-        for r in rows:
-            print(f"{r['client']:<16} {r['qname'][:39]:<40} {int(now - r['ts'])}s")
-
-
 SERVICE = "lan-logger.service"
 SERVICE_TEMPLATE = """[Unit]
 Description=lanlog: LAN DNS query and device logger
@@ -782,9 +710,7 @@ def cmd_config(args):
     print("-" * 52)
     for key, val in cfg.items():
         hint = ""
-        if key == "show_kinds":
-            hint = "  show the '(Vendor)' hint after a device name"
-        elif key == "hide_idle":
+        if key == "hide_idle":
             hint = "  hide devices that have never made a DNS query"
         elif key == "only":
             hint = "  comma-separated IPs to show, e.g. 192.168.1.88,192.168.1.163"
@@ -818,8 +744,7 @@ def cmd_toggle(args):
           f"picks this up on its next refresh")
 
 
-DEFAULT_KEYS = ["show_kinds", "hide_idle", "only", "labels", "query_lines",
-                "refresh"]
+DEFAULT_KEYS = ["hide_idle", "only", "labels", "query_lines", "refresh"]
 
 
 def cmd_name(args):
@@ -914,12 +839,6 @@ def main():
     sub.add_parser("reset")
     sub.add_parser("purge-reverse", help="delete stored PTR/reverse-lookup rows")
 
-    o = sub.add_parser("orbic", help="Orbic hotspot DNS logs (over SSH)")
-    o.add_argument("action", choices=["probe", "status", "sources"])
-    o.add_argument("--host", default=os.environ.get("ORBIC_HOST", "192.168.1.1"))
-    o.add_argument("--log", default=None)
-    o.add_argument("--lines", type=int, default=15)
-
     s = sub.add_parser("setup", help="detect this network and write the config")
     s.add_argument("--write", action="store_true",
                    help="write the config even if detection found problems")
@@ -965,8 +884,6 @@ def main():
     elif cmd == "purge-reverse":
         n = purge_reverse(db.connect())
         print(f"removed {n} reverse-lookup rows")
-    elif cmd == "orbic":
-        cmd_orbic(args)
     elif cmd == "config":
         cmd_config(args)
     elif cmd == "toggle":

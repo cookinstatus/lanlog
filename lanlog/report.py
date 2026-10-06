@@ -127,15 +127,6 @@ def show_devices(conn, window=None):
         print("no devices match the current display settings")
         return
 
-    # show_kinds must be applied to the resolver BEFORE describe_all(), because
-    # the hint is appended inside describe() at resolve time. Setting it after
-    # (as this used to) left the hint on for any name not already cached, which
-    # is why the setting appeared to do nothing until a restart.
-    if cfg.get("show_kinds", "yes").lower() in ("no", "false", "0"):
-        identify._set_kinds(False)
-    else:
-        identify._set_kinds(True)
-
     names = identify.describe_all(conn)
     mode = _label_mode(cfg)
 
@@ -292,9 +283,6 @@ def show_latest(conn, limit=8, window=None):
         return
 
     cfg = devcfg.load_config()
-    identify._set_kinds(
-        cfg.get("show_kinds", "yes").lower() not in ("no", "false", "0")
-    )
     names = identify.describe_all(conn)
     mode = _label_mode()
     show_block = bool(_block_table())

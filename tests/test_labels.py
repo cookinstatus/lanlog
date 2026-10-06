@@ -151,10 +151,10 @@ try:
               start)
     # The existing yes/no settings must keep accepting the spellings they always
     # took, or `labels` becomes the first setting that rejects them.
-    dev.set_config("show_kinds", "1")
-    check("show_kinds still takes 1", dev.load_config()["show_kinds"], "yes")
-    dev.set_config("show_kinds", "off")
-    check("show_kinds still takes off", dev.load_config()["show_kinds"], "no")
+    dev.set_config("hide_idle", "1")
+    check("hide_idle still takes 1", dev.load_config()["hide_idle"], "yes")
+    dev.set_config("hide_idle", "off")
+    check("hide_idle still takes off", dev.load_config()["hide_idle"], "no")
 finally:
     dev.CONFIG_FILE = _real_cfg
     if os.path.exists(_tmp_cfg):

@@ -26,7 +26,6 @@ QUICK = {
     "5": "client ",
     "6": "name list",
     "7": "config",          # opens the settings menu
-    "8": "orbic status",
     "0": "toggle",          # cycle device labels: names -> ip -> both
 }
 
@@ -43,7 +42,7 @@ DOMAIN_MENU_BY_KEY = {k: cmd for k, cmd, _h in DOMAIN_MENU}
 
 BAR_HINT = (
     "  [1]devices [2]domains [3]shared [4]3rd-party [5]client "
-    "[6]names [7]settings [8]orbic [0]labels   Esc quit"
+    "[6]names [7]settings [0]labels   Esc quit"
 )
 
 # Key [7] opens this menu instead of seeding a "config" command. Typing
@@ -52,12 +51,11 @@ BAR_HINT = (
 CONFIG_MENU = [
     ("1", "query_lines", "rows of recent queries (1-25)"),
     ("2", "refresh", "repaint interval in seconds (1-30)"),
-    ("3", "show_kinds", "show the (Vendor) hint  yes/no"),
-    ("4", "hide_idle", "hide devices with no queries  yes/no"),
-    ("5", "only", "comma-separated IPs, or blank for all"),
+    ("3", "hide_idle", "hide devices with no queries  yes/no"),
+    ("4", "only", "comma-separated IPs, or blank for all"),
     # names / ip / both. [0] in the command bar cycles this instead, which is
     # the faster route when you only want to see whether names are resolving.
-    ("6", "labels", "device column: names / ip / both"),
+    ("5", "labels", "device column: names / ip / both"),
 ]
 MENU_BY_KEY = {k: name for k, name, _h in CONFIG_MENU}
 
