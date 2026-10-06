@@ -117,6 +117,17 @@ def touch_device(conn, ip, mac=None, vendor=None, when=None):
     )
 
 
+def newest_ts(conn):
+    """The newest timestamp already stored, across queries and answers.
+
+    Used as a watermark so a replayed log tail cannot be ingested twice. Returns
+    0.0 on an empty database.
+    """
+    q = conn.execute("SELECT MAX(ts) FROM queries").fetchone()[0] or 0.0
+    a = conn.execute("SELECT MAX(last_seen) FROM answers").fetchone()[0] or 0.0
+    return max(q, a)
+
+
 def record_query(conn, ts, client, qname, qtype, outcome, detail=None,
                  source="pihole"):
     conn.execute(

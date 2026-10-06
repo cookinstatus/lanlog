@@ -138,6 +138,9 @@ Reports carry a wall-clock `last`/`time` column, so a row can be lined up
 against something else that happened rather than only read as "N minutes ago".
 Rows from a previous day show the date instead of the time.
 
+`lanlog domains`, `lanlog client`, the live dashboard and the tray all show the
+resolved addresses -- up to three, with a `(+N more)` count.
+
 `lanlog domains` shows up to three resolved addresses per domain, with a
 `(+N more)` count when there are more (a CDN name resolves to a dozen). `lanlog
 resolve [domain]` lists them all. `lanlog backfill` populates the address table

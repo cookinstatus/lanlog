@@ -1,6 +1,7 @@
 """Reporting: what is on the LAN and what it is talking to."""
 
 import re
+import sqlite3
 import time
 from collections import Counter, defaultdict
 
@@ -231,6 +232,10 @@ def _answers_for(conn, qnames, max_shown=3):
     column turns one row into a wall of text that pushes every other row off the
     screen. The count of what was omitted is kept so the truncation is visible
     rather than silently pretending there were only three.
+
+    Tolerant of a database without the table: a viewer pointed at an older
+    lanlog.db, or any foreign database, must still render its reports rather
+    than dying on a missing column.
     """
     if not qnames:
         return {}
@@ -240,10 +245,14 @@ def _answers_for(conn, qnames, max_shown=3):
     for i in range(0, len(names), 400):
         chunk = names[i:i + 400]
         marks = ",".join("?" * len(chunk))
-        for qname, ip in conn.execute(
-            f"SELECT qname, ip FROM answers WHERE qname IN ({marks}) "
-            f"ORDER BY qname, last_seen DESC", chunk
-        ):
+        try:
+            rows = conn.execute(
+                f"SELECT qname, ip FROM answers WHERE qname IN ({marks}) "
+                f"ORDER BY qname, last_seen DESC", chunk
+            )
+        except sqlite3.Error:
+            return {}
+        for qname, ip in rows:
             out.setdefault(qname, []).append(ip)
     shaped = {}
     for qname, ips in out.items():
@@ -293,7 +302,8 @@ def show_top_domains(conn, limit=25, window=None, show_ips=True):
 
 
 def latest_rows(conn, limit=8, window=None):
-    """The most recent queries, newest first, each with its blocking verdict.
+    """The most recent queries, newest first, each with its blocking verdict and
+    the addresses the name resolved to.
 
     Structured rather than pre-formatted because two callers need this and they
     want different things: show_latest() renders it as text for the tray popup,
@@ -315,8 +325,13 @@ def latest_rows(conn, limit=8, window=None):
                "ORDER BY ts DESC LIMIT ?")
         args = (limit,)
 
+    rows = list(conn.execute(sql, args))
+    # One query for every name on screen, not one per row: the live dashboard
+    # repaints every second and a per-row lookup would repeat the same set walk.
+    ips = _answers_for(conn, [r[3] for r in rows])
+
     out = []
-    for ts, client, qtype, qname in conn.execute(sql, args):
+    for ts, client, qtype, qname in rows:
         match = blocking.blocked_by(qname, table) if table else None
         out.append({
             "ts": ts,
@@ -324,6 +339,7 @@ def latest_rows(conn, limit=8, window=None):
             "client": client,
             "qtype": qtype,
             "qname": qname,
+            "address": ips.get(qname, ""),
             "blocked": match is not None,
             "match": match,
         })
@@ -381,6 +397,8 @@ def show_latest(conn, limit=8, window=None):
             line += f" {mark:<8}{' ' * (8 - len(plain))}"
             n_blocked += 1 if r["blocked"] else 0
         line += f" {r['qname'][:44]}"
+        if r.get("address"):
+            line += f"  {_c(r['address'], '2')}"
         print(line)
 
     if show_block:
@@ -502,10 +520,12 @@ def show_client(conn, ip, limit=40):
     name = _label({"ip": ip}, names, mode)
     total = sum(r[2] for r in rows)
     print(f"{name}  ({ip}): {total} queries, top {len(rows)}")
-    print(f"{'domain':<50} {'type':<6} {'queries':>8}  last")
-    print("-" * 80)
+    print(f"{'domain':<50} {'type':<6} {'queries':>8}  {'last':<9} address")
+    print("-" * 118)
+    ips = _answers_for(conn, [r[0] for r in rows])
     for qname, qtype, c, last in rows:
-        print(f"{qname[:50]:<50} {qtype:<6} {c:>8}  {_fmt_clock(last)}")
+        print(f"{qname[:50]:<50} {qtype:<6} {c:>8}  {_fmt_clock(last):<9} "
+              f"{ips.get(qname, '-')}")
 
 
 def show_shared(conn, limit=30):

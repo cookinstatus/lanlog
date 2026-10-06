@@ -48,7 +48,7 @@ def _stop(*_):
     _running = False
 
 
-def query_loop(conn, verbose):
+def query_loop(conn, verbose, since=None):
     """Stream Pi-hole log lines into the DB. Exits if the stream dies.
 
     Both the query lines and the reply/cached lines are read from the same
@@ -57,14 +57,25 @@ def query_loop(conn, verbose):
     resolved to). The two are separate tables because only the first carries a
     client -- joining them back together would mean guessing which device a
     reply belonged to.
+
+    `since` is a timestamp watermark. The tail replays the last 200 log lines on
+    every start so a restart does not lose what happened while the service was
+    down -- but that means the same lines arrive again on every restart, and
+    without a watermark they were stored again. Every restart today added
+    another copy of the same 200 lines. Lines at or before the watermark are
+    already in the database and are skipped.
     """
     seen = 0
     answers = 0
+    skipped = 0
     for line in ingest.stream():
         if not _running:
             break
         rec = ingest.classify(line)
         if rec is not None:
+            if since and rec[0] <= since:
+                skipped += 1
+                continue
             db.record_query(conn, *rec)
             seen += 1
             # No commit needed: autocommit mode (see db.connect).
@@ -73,9 +84,13 @@ def query_loop(conn, verbose):
             continue
         ans = ingest.classify_answer(line)
         if ans is not None:
+            if since and ans[0] <= since:
+                skipped += 1
+                continue
             db.record_answer(conn, *ans)
             answers += 1
-    print(f"ingest stream ended after {seen} queries, {answers} answers",
+    print(f"ingest stream ended after {seen} queries, {answers} answers"
+          + (f", {skipped} already-seen lines skipped" if skipped else ""),
           file=sys.stderr)
     return seen
 
@@ -135,6 +150,17 @@ def main():
     conn = db.connect()
     discover.load_oui()
 
+    # The tail replays the last 200 log lines on every start so a restart does
+    # not lose what happened while the service was down. Those lines were
+    # already stored, so the newest timestamp we hold is used as a watermark and
+    # anything at or before it is skipped -- without this, every restart added
+    # another copy of the same lines.
+    watermark = db.newest_ts(conn)
+    if watermark:
+        print(f"ingest watermark: skipping anything at or before "
+              f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(watermark))}",
+              file=sys.stderr)
+
     threads = []
     if args.sweep_interval > 0:
         t = threading.Thread(
@@ -145,7 +171,7 @@ def main():
         t.start()
         threads.append(t)
 
-    n = query_loop(conn, args.verbose)
+    n = query_loop(conn, args.verbose, since=watermark)
     print(f"ingest stream ended after {n} queries", file=sys.stderr)
 
 

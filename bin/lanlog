@@ -9,6 +9,7 @@
   lanlog shared       domains hit by more than one device
   lanlog resolve [d]  what a name resolved to (the IPs behind it)
   lanlog backfill     read existing Pi-hole logs for resolved addresses
+  lanlog dedupe       remove rows duplicated by a replayed log tail
   lanlog third-party  cross-device trackers
   lanlog reset        wipe the database
 
@@ -228,7 +229,8 @@ def dashboard(conn, window=900):
             # a per-row lookup inside the render loop -- repeated the same set
             # walk for every row on every repaint of a dashboard that repaints
             # every second.
-            verdicts = _block_verdicts([r[2] for r in fresh])
+            verdicts = _block_verdicts([r[3] for r in fresh])
+            addresses = report._answers_for(conn, [r[3] for r in fresh])
 
             # Choose banner size so the whole view fits the terminal. On a
             # standard 80x24 the full 14-row banner does not fit and the
@@ -358,10 +360,15 @@ def dashboard(conn, window=900):
                 out.append(_c(" LATEST QUERIES", BOLD))
                 for ts, client, qtype, qname in fresh:
                     dw = 24 if labels == "names" else 38
+                    # The resolved address comes from a single lookup for the
+                    # whole frame (see report.latest_rows); a per-row query on a
+                    # view that repaints every second would repeat the same walk.
+                    addr = addresses.get(qname, "")
                     out.append(f" {report._fmt_clock(ts):<9} "
                                f"{_dev(client, dw):<{dw}} {qtype:<6} "
                                f"{_block_mark(verdicts.get(qname))}"
-                               f"{qname[:40]}")
+                               f"{qname[:40]}"
+                               + (f"  {_c(addr, DIM)}" if addr else ""))
                 out.append("")
 
             if last_cmd:
@@ -851,6 +858,42 @@ def cmd_backfill(args):
     print(f"answers rows: {before} -> {after}   ({distinct} distinct name(s))")
 
 
+def cmd_dedupe(args):
+    """Remove rows that are exact duplicates of an earlier row.
+
+    The tail replays the last 200 log lines on every service start, and before
+    the watermark existed those lines were stored again each time -- so a day
+    with four restarts held four copies of the same queries. This collapses each
+    identical (ts, client, qname, qtype, outcome) group to its earliest row.
+
+    The watermark in lan-logger.py stops NEW duplicates; this clears the ones
+    already stored. VACUUM afterwards reclaims the space.
+    """
+    from lanlog import db as _db
+
+    conn = _db.connect()
+    before = conn.execute("SELECT COUNT(*) FROM queries").fetchone()[0]
+    dupes = conn.execute(
+        "SELECT COUNT(*) - COUNT(DISTINCT ts||client||qname||qtype||outcome) "
+        "FROM queries").fetchone()[0]
+    if not dupes:
+        print(f"no duplicates ({before} rows)")
+        return
+    if not args.yes:
+        print(f"{dupes} duplicate row(s) of {before}. Re-run with --yes to "
+              f"remove them.")
+        return
+    conn.execute(
+        "DELETE FROM queries WHERE id NOT IN ("
+        "  SELECT MIN(id) FROM queries"
+        "  GROUP BY ts, client, qname, qtype, outcome)")
+    after = conn.execute("SELECT COUNT(*) FROM queries").fetchone()[0]
+    print(f"removed {before - after} duplicate row(s): {before} -> {after}")
+    if args.vacuum:
+        conn.execute("VACUUM")
+        print("vacuumed")
+
+
 def purge_reverse(conn):
     """Delete reverse-lookup rows recorded before this filtering existed."""
     cur = conn.execute(
@@ -883,6 +926,10 @@ def main():
     c = sub.add_parser("client"); c.add_argument("ip"); c.add_argument("--limit", type=int, default=40)
     sub.add_parser("reset")
     sub.add_parser("purge-reverse", help="delete stored PTR/reverse-lookup rows")
+    dd = sub.add_parser("dedupe",
+                        help="remove rows duplicated by a replayed log tail")
+    dd.add_argument("--yes", action="store_true", help="actually delete")
+    dd.add_argument("--vacuum", action="store_true", help="VACUUM afterwards")
     bf = sub.add_parser("backfill",
                         help="read existing Pi-hole logs for resolved addresses")
     bf.add_argument("-v", "--verbose", action="store_true")
@@ -929,6 +976,8 @@ def main():
         cmd_record(args)
     elif cmd == "reset":
         cmd_reset(args)
+    elif cmd == "dedupe":
+        cmd_dedupe(args)
     elif cmd == "backfill":
         cmd_backfill(args)
     elif cmd == "purge-reverse":
